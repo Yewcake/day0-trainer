@@ -28,8 +28,15 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 RUN python3.12 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-RUN pip install -U pip wheel packaging && \
-    pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
+RUN pip install -U pip wheel packaging
+
+# Pre-install the two largest CUDA wheels in their own layers. Bundling all of
+# torch's CUDA deps into a single ~4GB layer was unreliable to pull on some
+# RunPod hosts (a mid-transfer stall forced a full restart of the whole
+# layer). Smaller layers survive transient stalls with a cheap retry instead.
+RUN pip install nvidia-cudnn-cu12==9.10.2.21 --index-url https://download.pytorch.org/whl/cu128
+RUN pip install nvidia-cublas-cu12==12.8.4.1 --index-url https://download.pytorch.org/whl/cu128
+RUN pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 
 # Diffusers/Transformers from main for fresh Krea2 support. Pin by rebuilding
 # the image when you want to advance these.
