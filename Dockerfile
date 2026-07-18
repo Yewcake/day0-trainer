@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/workspace/.hf_cache \
-    PYTORCH_ALLOC_CONF=expandable_segments:True \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     HF_XET_HIGH_PERFORMANCE=1
 
 RUN apt-get update && apt-get install --no-install-recommends -y \
