@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_num_inference_steps", type=int, default=28)
     parser.add_argument("--sample_guidance_scale", type=float, default=4.0)
     parser.add_argument("--sample_lora_scale", type=float, default=1.35)
-    parser.add_argument("--sample_compare_base", type=int, default=1)
+    parser.add_argument("--sample_compare_base", type=int, default=0)
     parser.add_argument("--sample_seed", type=int, default=1234)
     parser.add_argument("--allow_weight_mismatch", type=int, default=0)
     parser.add_argument("--rank", type=int, default=16)
