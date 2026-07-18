@@ -480,7 +480,8 @@ def create_job(payload: dict) -> dict:
         "save_every": 250, "sample_every": 500, "sample_steps": 12, "batch_size": 1,
         "rank": 32, "lokr_factor": 16, "lokr_full_rank": 0, "learning_rate": "1e-4",
         "warmup_steps": 100, "target_modules": "identity", "optimizer": "paged_adamw8bit",
-        "gradient_checkpointing": 1, "seed": 42,
+        "gradient_checkpointing": 1, "transformer_group_offload": 1, "group_offload_blocks": 1,
+        "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
     config.update({
@@ -515,6 +516,8 @@ def create_job(payload: dict) -> dict:
         "--target_modules", str(config["target_modules"]),
         "--optimizer", str(config["optimizer"]),
         "--gradient_checkpointing", str(config["gradient_checkpointing"]),
+        "--transformer_group_offload", str(config["transformer_group_offload"]),
+        "--group_offload_blocks", str(config["group_offload_blocks"]),
         "--seed", str(config["seed"]),
         "--enable_wandb", "0",
     ]
