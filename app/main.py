@@ -478,7 +478,7 @@ def create_job(payload: dict) -> dict:
     defaults = {
         "model_path": model_entry["default_path"], "resolution": 1024, "steps": 2000,
         "save_every": 250, "sample_every": 500, "sample_steps": 12, "batch_size": 1,
-        "rank": 32, "lokr_factor": 16, "lokr_full_rank": 0, "learning_rate": "1e-4",
+        "rank": 32, "lokr_factor": -1, "lokr_full_rank": 0, "learning_rate": "1e-4",
         "warmup_steps": 100, "target_modules": "identity", "optimizer": "paged_adamw8bit",
         "gradient_checkpointing": 1, "transformer_group_offload": 0, "group_offload_blocks": 1,
         "weight_decay": 0.01, "lokr_decompose_both": 0,

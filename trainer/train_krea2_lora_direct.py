@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--network_type", default="lora", choices=["lora", "lokr"])
-    parser.add_argument("--lokr_factor", type=int, default=16)
+    parser.add_argument("--lokr_factor", type=int, default=-1)  # -1 = auto (PEFT's own default)
     parser.add_argument("--lokr_full_rank", type=int, default=0)
     parser.add_argument("--lokr_decompose_both", type=int, default=0)
     parser.add_argument("--learning_rate", type=float, default=5e-5)

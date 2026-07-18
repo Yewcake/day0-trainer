@@ -226,7 +226,13 @@ async function showTrain(){
     <div class="row"><label>Network</label><select id="f_network" onchange="$('#jobform').classList.toggle('is-lokr',this.value==='lokr')">
       <option value="lora">LoRA</option><option value="lokr">LoKr</option></select></div>
     <div class="row"><label>Rank</label><input id="f_rank" type="number" value="32"></div>
-    <div class="row lokr-only"><label>LoKr factor</label><input id="f_factor" type="number" value="16"></div>
+    <div class="row lokr-only"><label>LoKr factor</label><select id="f_factor">
+      <option value="-1" selected>Auto</option>
+      <option value="4">4</option>
+      <option value="8">8</option>
+      <option value="16">16</option>
+      <option value="32">32</option>
+    </select></div>
     <div class="row lokr-only"><label>LoKr full rank</label><select id="f_fullrank"><option value="0">No (small files)</option><option value="1">Yes (max quality, huge files)</option></select></div>
     <div class="row lokr-only"><label>LoKr decompose both</label><select id="f_decompose"><option value="0">No</option><option value="1">Yes</option></select></div>
     <div class="row"><label>Resolution</label><input id="f_res" type="number" value="1024"></div>
