@@ -479,8 +479,8 @@ def create_job(payload: dict) -> dict:
         "model_path": model_entry["default_path"], "resolution": 1024, "steps": 2000,
         "save_every": 250, "sample_every": 500, "sample_steps": 12, "batch_size": 1,
         "rank": 32, "lokr_factor": 16, "lokr_full_rank": 0, "learning_rate": "1e-4",
-        "warmup_steps": 100, "target_modules": "identity", "optimizer": "adamw_fused",
-        "gradient_checkpointing": 0, "seed": 42,
+        "warmup_steps": 100, "target_modules": "identity", "optimizer": "paged_adamw8bit",
+        "gradient_checkpointing": 1, "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
     config.update({

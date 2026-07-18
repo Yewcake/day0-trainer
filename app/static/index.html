@@ -233,7 +233,7 @@ async function showTrain(){
     <div class="row"><label>Save every</label><input id="f_save" type="number" value="250"></div>
     <div class="row"><label>Sample every</label><input id="f_sample" type="number" value="500"></div>
     <div class="row"><label>Learning rate</label><input id="f_lr" value="1e-4"></div>
-    <div class="row"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1">On (saves VRAM)</option></select></div>
+    <div class="row"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1" selected>On (saves VRAM)</option></select></div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
     <div style="margin-top:14px"><button class="primary" type="submit">Start training</button></div>
