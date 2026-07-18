@@ -1,0 +1,31 @@
+{
+  "models": [
+    {
+      "id": "krea2-raw",
+      "label": "Krea 2 (Raw)",
+      "arch": "krea2",
+      "trainer": "trainer/train_krea2_lora_direct.py",
+      "default_path": "krea/Krea-2-Raw",
+      "networks": ["lora", "lokr"],
+      "enabled": true
+    },
+    {
+      "id": "krea2-turbo",
+      "label": "Krea 2 Turbo",
+      "arch": "krea2",
+      "trainer": "trainer/train_krea2_lora_direct.py",
+      "default_path": "krea/Krea-2-Turbo",
+      "networks": ["lora", "lokr"],
+      "enabled": true
+    },
+    {
+      "id": "z-image-turbo",
+      "label": "Z-Image Turbo (coming soon)",
+      "arch": "z-image",
+      "trainer": "",
+      "default_path": "",
+      "networks": ["lora", "lokr"],
+      "enabled": false
+    }
+  ]
+}
