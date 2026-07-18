@@ -480,7 +480,8 @@ def create_job(payload: dict) -> dict:
         "save_every": 250, "sample_every": 500, "sample_steps": 12, "batch_size": 1,
         "rank": 32, "lokr_factor": 16, "lokr_full_rank": 0, "learning_rate": "1e-4",
         "warmup_steps": 100, "target_modules": "identity", "optimizer": "paged_adamw8bit",
-        "gradient_checkpointing": 1, "transformer_group_offload": 1, "group_offload_blocks": 1,
+        "gradient_checkpointing": 1, "transformer_group_offload": 0, "group_offload_blocks": 1,
+        "weight_decay": 0.01, "lokr_decompose_both": 0,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -510,7 +511,9 @@ def create_job(payload: dict) -> dict:
         "--rank", str(rank), "--lora_alpha", str(rank),
         "--lokr_factor", str(config["lokr_factor"]),
         "--lokr_full_rank", str(config["lokr_full_rank"]),
+        "--lokr_decompose_both", str(config["lokr_decompose_both"]),
         "--learning_rate", str(config["learning_rate"]),
+        "--weight_decay", str(config["weight_decay"]),
         "--lr_scheduler", "cosine",
         "--lr_warmup_steps", str(config["warmup_steps"]),
         "--target_modules", str(config["target_modules"]),
