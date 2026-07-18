@@ -1314,7 +1314,7 @@ def train(args: argparse.Namespace) -> None:
             # Automagic manages its own per-parameter learning rates and ignores
             # the scheduler's param_group['lr'] entirely, so report its real
             # average rate instead of the (unused) cosine-decayed value.
-            lr = optimizer.get_avg_learning_rate() if isinstance(optimizer, Automagic) else scheduler.get_last_lr()[0]
+            lr = float(optimizer.get_avg_learning_rate()) if isinstance(optimizer, Automagic) else scheduler.get_last_lr()[0]
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}", epoch=epoch)
 
