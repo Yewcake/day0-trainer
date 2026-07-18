@@ -84,6 +84,13 @@
   .toast{position:fixed;bottom:18px;right:18px;background:var(--panel-2);border:1px solid var(--accent);padding:10px 14px;border-radius:8px;font-family:var(--mono);font-size:12px;display:none;z-index:20}
   .empty{color:var(--muted);font-size:13px;padding:8px 0}
   .hint{color:var(--muted);font-size:12px}
+  .modal-backdrop{position:fixed;inset:0;background:rgba(8,7,12,.6);display:none;align-items:center;justify-content:center;z-index:30}
+  .modal-box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px;min-width:320px;max-width:90vw}
+  .modal-box .modal-title{font-weight:600;margin-bottom:12px}
+  .modal-box .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+  .modal-box input{margin:0}
+  .uploadstatus{margin-top:10px}
+  .uploadstatus .hint{margin-bottom:4px}
   @media (max-width:820px){.app{grid-template-columns:1fr}.sidebar{border-right:none;border-bottom:1px solid var(--line)}}
 </style>
 </head>
@@ -104,6 +111,7 @@
 </div>
 <div class="lightbox" id="lightbox" onclick="this.style.display='none'"><img id="lightimg" alt=""></div>
 <div class="toast" id="toast"></div>
+<div class="modal-backdrop" id="modalBackdrop"><div class="modal-box" id="modalBox"></div></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -121,12 +129,60 @@ function toggleTheme(){
 }
 $('#themebtn').textContent = theme === 'light' ? 'Dark mode' : 'Light mode';
 
+function modalPrompt(title, {placeholder='', value='', type='text'}={}){
+  return new Promise(resolve=>{
+    const backdrop = $('#modalBackdrop'), box = $('#modalBox');
+    box.innerHTML = `<div class="modal-title">${title}</div>
+      <input id="modalInput" type="${type}" placeholder="${placeholder}" value="${value.replaceAll('"','&quot;')}">
+      <div class="modal-actions">
+        <button type="button" id="modalCancel">Cancel</button>
+        <button type="button" class="primary" id="modalOk">OK</button>
+      </div>`;
+    backdrop.style.display = 'flex';
+    const input = $('#modalInput'); input.focus(); input.select();
+    const done = val => { backdrop.style.display = 'none'; resolve(val); };
+    $('#modalOk').onclick = () => done(input.value);
+    $('#modalCancel').onclick = () => done(null);
+    input.onkeydown = e => {
+      if (e.key === 'Enter'){ e.preventDefault(); done(input.value); }
+      if (e.key === 'Escape') done(null);
+    };
+  });
+}
+function modalConfirm(message){
+  return new Promise(resolve=>{
+    const backdrop = $('#modalBackdrop'), box = $('#modalBox');
+    box.innerHTML = `<div class="modal-title">${message}</div>
+      <div class="modal-actions">
+        <button type="button" id="modalCancel">Cancel</button>
+        <button type="button" class="danger" id="modalOk">Confirm</button>
+      </div>`;
+    backdrop.style.display = 'flex';
+    const done = val => { backdrop.style.display = 'none'; resolve(val); };
+    $('#modalOk').onclick = () => done(true);
+    $('#modalCancel').onclick = () => done(false);
+  });
+}
+
+let pendingAuthPrompt = null;
+function promptForToken(){
+  if (!pendingAuthPrompt){
+    pendingAuthPrompt = modalPrompt('Access password', {type:'password', placeholder:'Enter the pod UI password'})
+      .then(val => {
+        TOKEN = val || '';
+        localStorage.setItem('day0_token', TOKEN);
+        pendingAuthPrompt = null;
+        return TOKEN;
+      });
+  }
+  return pendingAuthPrompt;
+}
+
 const api = async (path, opts={}) => {
   const sep = path.includes('?') ? '&' : '?';
   const res = await fetch(path + sep + 't=' + encodeURIComponent(TOKEN), opts);
   if (res.status === 401){
-    TOKEN = prompt('Access password:') || '';
-    localStorage.setItem('day0_token', TOKEN);
+    await promptForToken();
     return api(path, opts);
   }
   if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail || res.statusText);
@@ -176,7 +232,7 @@ async function showTrain(){
     <div class="row"><label>Steps</label><input id="f_steps" type="number" value="2000"></div>
     <div class="row"><label>Save every</label><input id="f_save" type="number" value="250"></div>
     <div class="row"><label>Sample every</label><input id="f_sample" type="number" value="500"></div>
-    <div class="row"><label>Learning rate</label><input id="f_lr" value="8e-5"></div>
+    <div class="row"><label>Learning rate</label><input id="f_lr" value="1e-4"></div>
     <div class="row"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1">On (saves VRAM)</option></select></div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
@@ -230,8 +286,12 @@ async function showDatasets(){
   $('#main').innerHTML = `
     <h2>Datasets</h2>
     <div class="dropzone" id="dropzone" onclick="$('#fileinput').click()">
-      Drop a folder, .zip / .rar / .7z, or loose images here — or click to browse
+      Drop a folder, .zip / .rar / .7z, loose images, or .txt captions here — or click to browse
       <input type="file" id="fileinput" multiple style="display:none" onchange="handleFiles([...this.files])">
+    </div>
+    <div class="uploadstatus" id="uploadstatus" style="display:none">
+      <div class="hint" id="uploadlabel"></div>
+      <div class="progressbar"><div id="uploadbar"></div></div>
     </div>
     <div id="dslist" style="margin-top:16px"></div>
     <div id="dsdetail"></div>`;
@@ -267,21 +327,59 @@ async function collectDropped(dt){
   return files;
 }
 
+function uploadChunk(path, form, onProgress){
+  return new Promise((resolve, reject)=>{
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', path + (path.includes('?')?'&':'?') + 't=' + encodeURIComponent(TOKEN));
+    xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded); };
+    xhr.onload = () => {
+      if (xhr.status === 401){ resolve({unauthorized:true}); return; }
+      if (xhr.status >= 200 && xhr.status < 300){ resolve(JSON.parse(xhr.responseText)); return; }
+      let detail = xhr.statusText;
+      try{ detail = JSON.parse(xhr.responseText).detail || detail; }catch(e){}
+      reject(new Error(detail));
+    };
+    xhr.onerror = () => reject(new Error('Upload failed'));
+    xhr.send(form);
+  });
+}
+
+function showUpload(visible, label){
+  $('#uploadstatus').style.display = visible ? 'block' : 'none';
+  if (label !== undefined) $('#uploadlabel').textContent = label;
+}
+function setUploadPct(pct){ $('#uploadbar').style.width = Math.max(0,Math.min(100,pct)) + '%'; }
+
 async function handleFiles(files){
   if (!files.length) return;
   const keep = files.filter(f=>/\.(png|jpe?g|webp|txt|zip|rar|7z)$/i.test(f.name));
   if (!keep.length){ toast('No usable files (images, txt, zip, rar, 7z).'); return; }
   const suggested = keep.length===1 ? keep[0].name.replace(/\.(zip|rar|7z)$/i,'') : 'dataset';
-  const name = prompt('Dataset name (existing name adds to it):', suggested);
+  const name = await modalPrompt('Dataset name (existing name adds to it)', {value: suggested});
   if (!name) return;
-  toast(`Uploading ${keep.length} file(s)…`);
+  const totalBytes = keep.reduce((s,f)=>s+f.size,0) || 1;
+  let sentBytes = 0, uploadedFiles = 0;
+  showUpload(true, `Uploading 0/${keep.length} file(s)…`);
+  setUploadPct(0);
   const CHUNK = 20;
-  for (let i=0; i<keep.length; i+=CHUNK){
-    const form = new FormData();
-    keep.slice(i, i+CHUNK).forEach(f=>form.append('files', f, f.name));
-    await api(`/api/datasets/${encodeURIComponent(name)}/files`, {method:'POST', body:form});
-  }
-  toast('Dataset updated.'); renderDatasetList(); openDataset(name);
+  try{
+    for (let i=0; i<keep.length; i+=CHUNK){
+      const slice = keep.slice(i, i+CHUNK);
+      const chunkBytes = slice.reduce((s,f)=>s+f.size,0);
+      const form = new FormData();
+      slice.forEach(f=>form.append('files', f, f.name));
+      const result = await uploadChunk(
+        `/api/datasets/${encodeURIComponent(name)}/files`, form,
+        loaded => setUploadPct(100*(sentBytes+loaded)/totalBytes),
+      );
+      if (result.unauthorized){ await promptForToken(); i -= CHUNK; continue; }
+      sentBytes += chunkBytes; uploadedFiles += slice.length;
+      showUpload(true, `Uploading ${uploadedFiles}/${keep.length} file(s)…`);
+    }
+    toast('Dataset updated.');
+  }catch(e){ toast('Upload error: '+e.message); }
+  showUpload(false);
+  renderDatasetList(); openDataset(name);
 }
 
 async function renderDatasetList(){
@@ -295,7 +393,7 @@ async function renderDatasetList(){
 }
 
 async function deleteDataset(name){
-  if (!confirm(`Delete dataset '${name}' and all its files?`)) return;
+  if (!(await modalConfirm(`Delete dataset '${name}' and all its files?`))) return;
   await api(`/api/datasets/${encodeURIComponent(name)}`, {method:'DELETE'});
   toast('Dataset deleted.'); renderDatasetList(); $('#dsdetail').innerHTML='';
 }
@@ -320,7 +418,10 @@ async function openDataset(name){
         <div class="progressbar" style="flex:1"><div id="cap_bar"></div></div>
         <span class="hint" id="cap_stat">idle</span></div>
     </div>
-    <h3>Images</h3><div class="dsgrid" id="dsgrid"></div>`;
+    <div class="toolbar" style="margin-top:16px;margin-bottom:0"><h3 style="margin:0">Images</h3>
+      <div class="spacer"></div>
+      <button type="button" class="primary" onclick="saveAllCaptions('${name}')">Save dataset</button></div>
+    <div class="dsgrid" id="dsgrid"></div>`;
   loadGeminiModels(true);
   renderItems(name);
 }
@@ -333,18 +434,47 @@ async function loadGeminiModels(silent){
   }catch(e){ if(!silent) toast(e.message); }
 }
 
+const escHtml = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+
 async function renderItems(name){
   const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
   $('#dsgrid').innerHTML = items.map(it=>{
     const src = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
     return `<div class="dsitem"><img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
-      <textarea placeholder="no caption" onblur="saveCaption('${name}','${it.image}',this)">${it.caption}</textarea></div>`;
+      <textarea placeholder="no caption" data-image="${escHtml(it.image)}" data-saved="${escHtml(it.caption)}"
+        onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea></div>`;
   }).join('') || '<div class="empty">No images.</div>';
 }
 
-async function saveCaption(name, image, el){
-  await put(`/api/datasets/${encodeURIComponent(name)}/caption/${encodeURIComponent(image)}`, {caption: el.value});
+async function saveCaption(name, el){
+  if (el.value === el.dataset.saved) return;
+  await put(`/api/datasets/${encodeURIComponent(name)}/caption/${encodeURIComponent(el.dataset.image)}`, {caption: el.value});
+  el.dataset.saved = el.value;
   toast('Caption saved.');
+}
+
+async function saveAllCaptions(name){
+  const boxes = [...document.querySelectorAll('#dsgrid textarea')];
+  let saved = 0;
+  for (const el of boxes){
+    if (el.value !== el.dataset.saved){
+      await put(`/api/datasets/${encodeURIComponent(name)}/caption/${encodeURIComponent(el.dataset.image)}`, {caption: el.value});
+      el.dataset.saved = el.value; saved++;
+    }
+  }
+  toast(saved ? `Saved ${saved} caption(s).` : 'Nothing to save — all captions already saved.');
+}
+
+async function refreshCaptionsLive(name, force){
+  const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
+  for (const it of items){
+    const box = document.querySelector(`#dsgrid textarea[data-image="${CSS.escape(it.image)}"]`);
+    if (!box) continue;
+    if (document.activeElement === box && !force) continue; // don't clobber an in-progress edit
+    if (box.dataset.saved === it.caption) continue; // no change since last render
+    box.value = it.caption;
+    box.dataset.saved = it.caption;
+  }
 }
 
 async function captionAll(name){
@@ -360,8 +490,9 @@ async function captionAll(name){
     const pct = s.total ? Math.round(100*s.done/s.total) : 0;
     $('#cap_bar').style.width = pct+'%';
     $('#cap_stat').textContent = `${s.status} ${s.done||0}/${s.total||0}` + (s.errors?.length?` · ${s.errors.length} errors`:'');
+    await refreshCaptionsLive(name);
     if (['finished','cancelled','idle'].includes(s.status)){
-      clearInterval(capTimer); renderItems(name); renderDatasetList();
+      clearInterval(capTimer); await refreshCaptionsLive(name, true); renderDatasetList();
       if (s.errors?.length) toast(s.errors[0]);
     }
   }, 2000);
@@ -399,11 +530,11 @@ async function analyzeJob(id){
 }
 
 async function stopJob(id){
-  if(!confirm('Stop this training run?')) return;
+  if(!(await modalConfirm('Stop this training run?'))) return;
   try{ await post(`/api/jobs/${id}/stop`); toast('Job stopped.'); }catch(e){ toast(e.message); }
 }
 async function deleteJob(id){
-  if(!confirm('Delete this job and all its checkpoints?')) return;
+  if(!(await modalConfirm('Delete this job and all its checkpoints?'))) return;
   try{ await api(`/api/jobs/${id}`, {method:'DELETE'}); toast('Job deleted.'); showTrain(); }catch(e){ toast(e.message); }
 }
 
@@ -505,7 +636,7 @@ async function saveSettings(){
 }
 
 async function selfUpdate(){
-  if(!confirm('Pull latest code and restart the UI? (Not possible while a job is running.)')) return;
+  if(!(await modalConfirm('Pull latest code and restart the UI? (Not possible while a job is running.)'))) return;
   try{ await post('/api/update'); }catch(e){ toast(e.message); return; }
   toast('Updating… reconnecting shortly.');
   setTimeout(()=>location.reload(), 8000);

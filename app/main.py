@@ -216,11 +216,26 @@ def gemini_models() -> list[dict]:
 # --------------------------------------------------------------------------
 # Datasets: multi-format intake, browsing, captions
 # --------------------------------------------------------------------------
+JUNK_NAMES = {".DS_Store", "Thumbs.db"}
+
+
 def extract_archive(archive: Path, target: Path) -> None:
     suffix = archive.suffix.lower()
     if suffix == ".zip":
+        target_root = target.resolve()
         with zipfile.ZipFile(archive) as handle:
-            handle.extractall(target)
+            for info in handle.infolist():
+                if info.filename.startswith("__MACOSX/") or Path(info.filename).name in JUNK_NAMES:
+                    continue
+                dest = (target / info.filename).resolve()
+                if dest != target_root and target_root not in dest.parents:
+                    continue  # zip-slip guard: entry would land outside the dataset dir
+                if info.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with handle.open(info) as src, dest.open("wb") as out:
+                    shutil.copyfileobj(src, out)
         return
     seven_zip = shutil.which("7z") or shutil.which("7za") or shutil.which("7zr")
     if seven_zip is None:
@@ -231,6 +246,9 @@ def extract_archive(archive: Path, target: Path) -> None:
     )
     if result.returncode != 0:
         raise HTTPException(status_code=400, detail=f"Extraction failed: {result.stderr[-300:] or result.stdout[-300:]}")
+    for junk in target.rglob("*"):
+        if junk.is_file() and (junk.name in JUNK_NAMES or "__MACOSX" in junk.parts):
+            junk.unlink(missing_ok=True)
 
 
 def flatten_dataset(target: Path) -> None:
@@ -460,7 +478,7 @@ def create_job(payload: dict) -> dict:
     defaults = {
         "model_path": model_entry["default_path"], "resolution": 1024, "steps": 2000,
         "save_every": 250, "sample_every": 500, "sample_steps": 12, "batch_size": 1,
-        "rank": 32, "lokr_factor": 16, "lokr_full_rank": 0, "learning_rate": "8e-5",
+        "rank": 32, "lokr_factor": 16, "lokr_full_rank": 0, "learning_rate": "1e-4",
         "warmup_steps": 100, "target_modules": "identity", "optimizer": "adamw_fused",
         "gradient_checkpointing": 0, "seed": 42,
     }
