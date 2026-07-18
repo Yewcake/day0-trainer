@@ -630,7 +630,10 @@ def download_checkpoint(job_id: str, step: str) -> FileResponse:
     path = job_dir(job_id) / "run" / "checkpoints" / safe_name(step) / "krea2_comfy_native_lora.safetensors"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Checkpoint not found.")
-    return FileResponse(path, filename=f"{job_id}_{step}.safetensors")
+    config = json.loads((job_dir(job_id) / "config.json").read_text())
+    step_num = step.removeprefix("step-").lstrip("0") or "0"
+    filename = safe_name(f"{config['dataset']}_{config['model_id']}_{step_num}") + ".safetensors"
+    return FileResponse(path, filename=filename)
 
 
 # --------------------------------------------------------------------------
