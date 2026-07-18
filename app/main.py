@@ -644,18 +644,31 @@ def analyze_job(job_id: str) -> dict:
 
     metrics = job_metrics(job_id, max_points=150)["points"]
     config = json.loads((job_dir(job_id) / "config.json").read_text())
+    status = job_status(job_id)
+    last_step = metrics[-1]["step"] if metrics else 0
     loss_summary = [{"step": p["step"], "loss": p["loss"]} for p in metrics]
+
+    run_state = (
+        f"This run is still IN PROGRESS: {last_step}/{config.get('steps', '?')} steps so far. "
+        "Don't assume it has finished or converged — judge only what's visible so far, and don't "
+        "suggest changes to settings that already match the config below."
+        if status == "running" else
+        f"This run has ENDED (status: {status}) at step {last_step}/{config.get('steps', '?')}."
+    )
 
     parts: list[dict] = [{
         "text": (
-            "You are an expert LoRA/LoKr character-identity trainer. Below is the training "
-            "config, the downsampled loss curve, and one sample image per saved checkpoint "
-            "(labelled with its step). The goal is a character identity adapter: judge likeness "
-            "stability, overfitting signs (plastic skin, rigid pose, artifacting, burned "
-            "contrast) and pick the 1-2 best candidate checkpoints. Respond with: (1) best "
-            "candidate step(s) and why, (2) over/underfitting verdict, (3) one concrete "
-            "suggestion for the next run. Be concise.\n\n"
-            f"Config: {json.dumps({k: config[k] for k in ('network_type', 'rank', 'lokr_factor', 'steps', 'learning_rate', 'resolution') if k in config})}\n"
+            "You are an expert LoRA/LoKr character-identity trainer. Below is the FULL training "
+            "config actually used (do not assume or guess any setting not shown — everything "
+            "relevant is included), the run's current state, the downsampled loss curve, and one "
+            "sample image per saved checkpoint (labelled with its step). The goal is a character "
+            "identity adapter: judge likeness stability, overfitting signs (plastic skin, rigid "
+            "pose, artifacting, burned contrast) and pick the 1-2 best candidate checkpoints. "
+            "Respond with: (1) best candidate step(s) and why, (2) over/underfitting verdict, "
+            "(3) one concrete suggestion for the next run — only if the current config doesn't "
+            "already reflect it. Be concise.\n\n"
+            f"Run state: {run_state}\n"
+            f"Full config: {json.dumps(config)}\n"
             f"Loss curve: {json.dumps(loss_summary)}"
         )
     }]

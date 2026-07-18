@@ -228,11 +228,20 @@ async function showTrain(){
     <div class="row"><label>Rank</label><input id="f_rank" type="number" value="32"></div>
     <div class="row lokr-only"><label>LoKr factor</label><input id="f_factor" type="number" value="16"></div>
     <div class="row lokr-only"><label>LoKr full rank</label><select id="f_fullrank"><option value="0">No (small files)</option><option value="1">Yes (max quality, huge files)</option></select></div>
+    <div class="row lokr-only"><label>LoKr decompose both</label><select id="f_decompose"><option value="0">No</option><option value="1">Yes</option></select></div>
     <div class="row"><label>Resolution</label><input id="f_res" type="number" value="1024"></div>
     <div class="row"><label>Steps</label><input id="f_steps" type="number" value="2000"></div>
     <div class="row"><label>Save every</label><input id="f_save" type="number" value="250"></div>
     <div class="row"><label>Sample every</label><input id="f_sample" type="number" value="500"></div>
+    <div class="row"><label>Optimizer</label><select id="f_optimizer">
+      <option value="paged_adamw8bit" selected>Paged AdamW 8-bit (default, memory-safe)</option>
+      <option value="adamw8bit">AdamW 8-bit</option>
+      <option value="adamw_fused">AdamW (fused)</option>
+      <option value="adamw">AdamW</option>
+      <option value="automagic">Automagic (adaptive per-parameter LR)</option>
+    </select></div>
     <div class="row"><label>Learning rate</label><input id="f_lr" value="1e-4"></div>
+    <div class="row"><label>Weight decay</label><input id="f_wd" value="0.01"></div>
     <div class="row"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1" selected>On (saves VRAM)</option></select></div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
@@ -270,9 +279,12 @@ async function submitJob(ev){
     hf_token: $('#f_hf').value.trim(), save_hf_token: $('#f_hf_save').checked,
     network_type: $('#f_network').value, rank:+$('#f_rank').value,
     lokr_factor:+$('#f_factor').value, lokr_full_rank:+$('#f_fullrank').value,
+    lokr_decompose_both:+$('#f_decompose').value,
     resolution:+$('#f_res').value, steps:+$('#f_steps').value,
     save_every:+$('#f_save').value, sample_every:+$('#f_sample').value,
-    learning_rate: $('#f_lr').value, gradient_checkpointing:+$('#f_gc').value,
+    optimizer: $('#f_optimizer').value,
+    learning_rate: $('#f_lr').value, weight_decay:+$('#f_wd').value,
+    gradient_checkpointing:+$('#f_gc').value,
     sample_prompts: prompts,
   };
   try{ const job = await post('/api/jobs', payload); toast('Training started.'); openJob(job.id); }

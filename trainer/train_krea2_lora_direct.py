@@ -28,6 +28,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 
+from automagic import Automagic
+
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -69,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_warmup_steps", type=int, default=100)
     parser.add_argument("--lora_type", default="character", choices=["character", "style", "pose", "custom"])
     parser.add_argument("--target_modules", default="character")
-    parser.add_argument("--optimizer", default="paged_adamw8bit", choices=["adamw_fused", "adamw8bit", "paged_adamw8bit", "adamw"])
+    parser.add_argument("--optimizer", default="paged_adamw8bit", choices=["adamw_fused", "adamw8bit", "paged_adamw8bit", "adamw", "automagic"])
     parser.add_argument("--enable_buckets", type=int, default=1)
     parser.add_argument("--bucket_no_upscale", type=int, default=1)
     parser.add_argument("--bucket_step", type=int, default=16)
@@ -1065,6 +1067,13 @@ def train(args: argparse.Namespace) -> None:
                 eps=args.adam_epsilon,
                 weight_decay=args.weight_decay,
             )
+    elif args.optimizer == "automagic":
+        optimizer = Automagic(
+            trainable,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        print("Using Automagic optimizer (adaptive per-parameter learning rate).")
     else:
         optimizer = torch.optim.AdamW(
             trainable,
@@ -1302,7 +1311,10 @@ def train(args: argparse.Namespace) -> None:
                 torch.cuda.empty_cache()
 
             global_step += 1
-            lr = scheduler.get_last_lr()[0]
+            # Automagic manages its own per-parameter learning rates and ignores
+            # the scheduler's param_group['lr'] entirely, so report its real
+            # average rate instead of the (unused) cosine-decayed value.
+            lr = optimizer.get_avg_learning_rate() if isinstance(optimizer, Automagic) else scheduler.get_last_lr()[0]
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}", epoch=epoch)
 
