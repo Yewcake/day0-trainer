@@ -21,21 +21,27 @@ The Docker image contains only the heavy environment (CUDA, PyTorch, Diffusers, 
 - Change UI or trainer code → push to `main` → restart pod or click Update. No rebuild.
 - Change dependencies (Dockerfile) → push → GitHub Action rebuilds and pushes the image to GHCR automatically.
 
-## One-time setup
+## Deploying your own pod
 
-1. Push this repo to GitHub (private is fine for the code; the image on GHCR must be public or you add registry credentials to the RunPod template).
+This repo and its GHCR image are both public, so no credentials are needed to pull either.
+
+1. Deploy a pod from the **day0-trainer** RunPod template (or build your own from this repo — see below).
+2. When deploying, set your own **`UI_PASSWORD`** — the template does not ship with a fixed one, so leaving it unset means the UI is open to anyone with the pod's URL.
+3. Open the HTTP service on port 8888, enter your password, upload a dataset, start training.
+
+## One-time setup (building your own template)
+
+1. Fork or push this repo to GitHub.
 2. Let the GitHub Action build the image once (Actions tab → "Build and push trainer image" → Run workflow). It lands at `ghcr.io/<you>/<repo>:latest`.
 3. Create the RunPod template:
    - **Container image**: `ghcr.io/<you>/<repo>:latest`
    - **Expose HTTP port**: `8888`
    - **Volume**: mount path `/workspace`, 150 GB+ recommended (model cache, datasets, checkpoints all persist here)
    - **Environment variables**:
-     - `TRAINER_REPO_URL` — this repo's clone URL (use an `https://<token>@github.com/...` URL if the repo is private)
+     - `TRAINER_REPO_URL` — this repo's clone URL (use an `https://<token>@github.com/...` URL only if your fork is private)
      - `TRAINER_REPO_BRANCH` — optional, default `main`
      - `HF_TOKEN` — Hugging Face token for pulling Krea 2 weights
-     - `UI_PASSWORD` — access password for the web UI (strongly recommended)
-
-Deploy a pod from the template, open the HTTP service on port 8888, enter the password, upload a dataset zip, start training.
+     - `UI_PASSWORD` — access password for the web UI (leave unset to force each deployer to set their own if you publish the template)
 
 ## Layout
 
