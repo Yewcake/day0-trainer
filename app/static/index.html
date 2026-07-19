@@ -223,8 +223,11 @@ async function showTrain(){
       </div></div>
     <div class="row"><label>Dataset</label><select id="f_dataset"></select></div>
     <div class="row"><label>Trigger word</label><input id="f_trigger" value=""></div>
-    <div class="row"><label>Network</label><select id="f_network" onchange="$('#jobform').classList.toggle('is-lokr',this.value==='lokr')">
+    <div class="row"><label>Network</label><select id="f_network" onchange="$('#jobform').classList.toggle('is-lokr',this.value==='lokr'); if(!$('#f_unlock').checked) applyProvenSettings();">
       <option value="lora">LoRA</option><option value="lokr">LoKr</option></select></div>
+    <div class="row"><label>Advanced settings</label>
+      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_unlock" style="width:auto" onchange="toggleAdvancedLock()">Edit advanced training settings (unchecked = use proven defaults, locked)</label>
+    </div>
     <div class="row"><label>Rank</label><input id="f_rank" type="number" value="32"></div>
     <div class="row lokr-only"><label>LoKr factor</label><select id="f_factor">
       <option value="-1" selected>Auto</option>
@@ -258,6 +261,39 @@ async function showTrain(){
     || '<option value="">— no datasets, add one first —</option>';
   addPrompt('A realistic smartphone portrait photo of TRIGGER woman, natural expression, daylight, no text.');
   addPrompt('A candid outdoor selfie photo of TRIGGER woman, relaxed expression, blurred city background, no text.');
+  toggleAdvancedLock();
+}
+
+// Settings confirmed working end-to-end on this trainer (fixed the OOM/device-mismatch/
+// wrong-optimizer issues from earlier debugging). Locked by default so a first run
+// doesn't have to rediscover them; the "edit advanced settings" checkbox unlocks them.
+const PROVEN_SETTINGS = {
+  lora: {
+    f_rank: '32', f_res: '1024', f_optimizer: 'automagic',
+    f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
+  },
+  lokr: {
+    f_rank: '32', f_factor: '4', f_fullrank: '1', f_decompose: '0', f_res: '1024',
+    f_optimizer: 'automagic', f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
+  },
+};
+const LOCKED_FIELD_IDS = ['f_rank','f_factor','f_fullrank','f_decompose','f_res','f_optimizer','f_lr','f_wd','f_gc'];
+
+function applyProvenSettings(){
+  const preset = PROVEN_SETTINGS[$('#f_network').value];
+  for (const [id, val] of Object.entries(preset)){
+    const el = $('#'+id);
+    if (el) el.value = val;
+  }
+}
+
+function toggleAdvancedLock(){
+  const unlocked = $('#f_unlock').checked;
+  for (const id of LOCKED_FIELD_IDS){
+    const el = $('#'+id);
+    if (el) el.disabled = !unlocked;
+  }
+  if (!unlocked) applyProvenSettings();
 }
 
 function addPrompt(value=''){
