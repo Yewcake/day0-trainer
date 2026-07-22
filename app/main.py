@@ -388,9 +388,15 @@ def set_caption(name: str, image: str, payload: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Optional image enhancement (Flux.2 Klein via a trimmed ComfyUI graph).
-# Nothing downloads until /api/enhance/setup is explicitly called.
+# Optional image enhancement (diffusers' native Flux2KleinPipeline).
+# Nothing downloads until /api/enhance/setup is explicitly called. Shares the
+# GPU with training, so both guard against the other being active.
 # --------------------------------------------------------------------------
+def _training_active() -> bool:
+    reap_finished()
+    return any(proc.poll() is None for proc in _active.values())
+
+
 @app.get("/api/enhance/status", dependencies=[Depends(require_auth)])
 def enhance_status() -> dict:
     return enhance.get_status()
@@ -398,8 +404,10 @@ def enhance_status() -> dict:
 
 @app.post("/api/enhance/setup", dependencies=[Depends(require_auth)])
 def enhance_setup() -> dict:
+    if _training_active():
+        raise HTTPException(status_code=409, detail="A training job is running -- stop it first, enhance needs the same GPU.")
     status = enhance.get_status()["status"]
-    if status in ("cloning", "installing", "downloading", "starting"):
+    if status in ("downloading", "starting"):
         raise HTTPException(status_code=409, detail="Setup already in progress.")
     if status == "ready":
         return {"status": "ready"}
@@ -417,6 +425,8 @@ def enhance_default_prompt() -> dict:
 def enhance_image(name: str, image: str, payload: dict) -> dict:
     if not enhance.is_ready():
         raise HTTPException(status_code=409, detail="Enhance isn't set up yet.")
+    if _training_active():
+        raise HTTPException(status_code=409, detail="A training job is running -- stop it first, enhance needs the same GPU.")
     source = dataset_dir(name) / safe_name(image)
     if not source.is_file():
         raise HTTPException(status_code=404, detail="Image not found.")
@@ -546,6 +556,8 @@ def create_job(payload: dict) -> dict:
     reap_finished()
     if any(proc.poll() is None for proc in _active.values()):
         raise HTTPException(status_code=409, detail="A job is already running. One GPU, one job.")
+    if enhance.is_ready():
+        enhance.unload()  # frees its ~20GB+ before training claims the GPU
 
     dataset = safe_name(str(payload.get("dataset", "")))
     dataset_path = DATASETS_DIR / dataset

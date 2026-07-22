@@ -564,13 +564,15 @@ async function openEnhance(name, image){
 
 function showEnhanceSetupModal(name, image, status){
   const backdrop = $('#modalBackdrop'), box = $('#modalBox');
-  const busy = ['cloning','installing','downloading','starting'].includes(status.status);
+  const busy = ['downloading','starting'].includes(status.status);
   box.innerHTML = `<div class="modal-title">Set up image enhancement</div>
     <div class="hint" style="margin-bottom:12px;display:block">
-      One-time download of ComfyUI + the Flux.2 Klein model (~15-20GB). That model is gated on
-      Hugging Face — log into huggingface.co with the account matching your saved HF token, open
-      <a href="https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8" target="_blank" rel="noopener">black-forest-labs/FLUX.2-klein-9b-fp8</a>,
-      and click "Agree" once before this can succeed.
+      One-time download of the Flux.2 Klein model (~18GB). It's gated on Hugging Face — log into
+      huggingface.co with the account matching your saved HF token, open
+      <a href="https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B" target="_blank" rel="noopener">black-forest-labs/FLUX.2-klein-base-9B</a>,
+      click "Agree" once, and make sure your token has "Read access to contents of all public gated
+      repos you can access" enabled (Settings → Access Tokens). Also uses the same GPU as training,
+      so stop any running job first.
     </div>
     <div id="enhanceSetupStatus" class="hint" style="display:block;margin-bottom:12px">${status.status==='failed' ? 'Failed: '+escHtml(status.error) : (status.detail || 'Not started.')}</div>
     <div class="modal-actions">
