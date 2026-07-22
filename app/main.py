@@ -93,7 +93,10 @@ def dataset_dir(name: str) -> Path:
 
 
 def dataset_images(path: Path) -> list[Path]:
-    return sorted(p for p in path.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
+    return sorted(
+        p for p in path.rglob("*")
+        if p.suffix.lower() in IMAGE_EXTS and ".thumbs" not in p.relative_to(path).parts
+    )
 
 
 def job_status(job_id: str) -> str:
