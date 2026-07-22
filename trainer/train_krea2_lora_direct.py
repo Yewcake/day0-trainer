@@ -1079,7 +1079,10 @@ def train(args: argparse.Namespace) -> None:
     torch.cuda.empty_cache()
 
     transformer.requires_grad_(False)
-    transformer.to(device=device, dtype=train_dtype)
+    # from_pretrained(torch_dtype=train_dtype) above already keeps norm/norm_q/norm_k in fp32
+    # for numerical stability -- a device+dtype .to() here would blanket-recast them back to
+    # train_dtype, undoing that. Device-only move preserves the mixed per-module dtypes.
+    transformer.to(device)
     maybe_set_attention_backend(transformer, args.attention_backend)
     maybe_enable_fp8_base(transformer, bool(args.fp8_base))
     if args.gradient_checkpointing and hasattr(transformer, "enable_gradient_checkpointing"):
@@ -1267,9 +1270,16 @@ def train(args: argparse.Namespace) -> None:
 
                             lokr_state = load_file(lora_dir / "pytorch_lokr_weights.safetensors")
                             sample_config = build_network_config(args, target_modules)
+                            pre_inject_params = {n for n, _ in sample_pipe.transformer.named_parameters()}
                             inject_adapter_in_model(sample_config, sample_pipe.transformer)
                             set_peft_model_state_dict(sample_pipe.transformer, lokr_state)
-                            sample_pipe.transformer.to(device=device, dtype=torch.bfloat16)
+                            # Only cast the freshly-injected LoKr params to match the pipeline's
+                            # compute dtype -- a blanket .to(dtype=...) on the whole transformer
+                            # here would also recast norm/norm_q/norm_k, which from_pretrained
+                            # deliberately keeps in fp32 for numerical stability.
+                            for name, param in sample_pipe.transformer.named_parameters():
+                                if name not in pre_inject_params:
+                                    param.data = param.data.to(device=device, dtype=torch.bfloat16)
                             touched = apply_peft_scaling(sample_pipe.transformer, args.sample_lora_scale)
                             print(
                                 f"Injected sample LoKr adapter at weight {args.sample_lora_scale}"
