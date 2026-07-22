@@ -550,8 +550,99 @@ async function renderItems(name){
     const src = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
     return `<div class="dsitem"><img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
       <textarea placeholder="no caption" data-image="${escHtml(it.image)}" data-saved="${escHtml(it.caption)}"
-        onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea></div>`;
+        onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea>
+      <div style="padding:0 8px 8px"><button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button></div></div>`;
   }).join('') || '<div class="empty">No images.</div>';
+}
+
+/* ---------------- image enhance (Flux.2 Klein, optional) ---------------- */
+async function openEnhance(name, image){
+  const status = await api('/api/enhance/status');
+  if (status.status !== 'ready') showEnhanceSetupModal(name, image, status);
+  else showEnhanceModal(name, image);
+}
+
+function showEnhanceSetupModal(name, image, status){
+  const backdrop = $('#modalBackdrop'), box = $('#modalBox');
+  const busy = ['cloning','installing','downloading','starting'].includes(status.status);
+  box.innerHTML = `<div class="modal-title">Set up image enhancement</div>
+    <div class="hint" style="margin-bottom:12px;display:block">
+      One-time download of ComfyUI + the Flux.2 Klein model (~15-20GB). That model is gated on
+      Hugging Face — log into huggingface.co with the account matching your saved HF token, open
+      <a href="https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8" target="_blank" rel="noopener">black-forest-labs/FLUX.2-klein-9b-fp8</a>,
+      and click "Agree" once before this can succeed.
+    </div>
+    <div id="enhanceSetupStatus" class="hint" style="display:block;margin-bottom:12px">${status.status==='failed' ? 'Failed: '+escHtml(status.error) : (status.detail || 'Not started.')}</div>
+    <div class="modal-actions">
+      <button type="button" id="modalCancel">Cancel</button>
+      <button type="button" class="primary" id="modalOk" ${busy?'disabled':''}>${busy ? 'Setting up…' : (status.status==='failed' ? 'Retry setup' : 'Set up now')}</button>
+    </div>`;
+  backdrop.style.display = 'flex';
+  $('#modalCancel').onclick = () => { backdrop.style.display = 'none'; };
+  $('#modalOk').onclick = async () => {
+    try{ await post('/api/enhance/setup', {}); }catch(e){ toast(e.message); return; }
+    $('#modalOk').disabled = true; $('#modalOk').textContent = 'Setting up…';
+    pollEnhanceSetup(name, image);
+  };
+  if (busy) pollEnhanceSetup(name, image);
+}
+
+async function pollEnhanceSetup(name, image){
+  const timer = setInterval(async ()=>{
+    const el = $('#enhanceSetupStatus');
+    if (!el){ clearInterval(timer); return; } // modal was closed/replaced
+    const s = await api('/api/enhance/status');
+    el.textContent = `${s.status}${s.detail ? ': '+s.detail : ''}`;
+    if (s.status === 'ready'){
+      clearInterval(timer);
+      showEnhanceModal(name, image);
+    } else if (s.status === 'failed'){
+      clearInterval(timer);
+      el.textContent = 'Failed: ' + s.error;
+      const btn = $('#modalOk'); if (btn){ btn.disabled = false; btn.textContent = 'Retry setup'; }
+    }
+  }, 3000);
+}
+
+async function showEnhanceModal(name, image){
+  const backdrop = $('#modalBackdrop'), box = $('#modalBox');
+  const def = await api('/api/enhance/default_prompt');
+  box.innerHTML = `<div class="modal-title">Enhance ${escHtml(image)}</div>
+    <textarea id="enhancePrompt" style="min-height:80px;width:100%;margin-bottom:10px">${escHtml(def.prompt)}</textarea>
+    <div class="modal-actions">
+      <button type="button" id="modalCancel">Close</button>
+      <button type="button" class="primary" id="enhanceGo">Generate 4 candidates</button>
+    </div>
+    <div id="enhanceResults" style="margin-top:14px"></div>`;
+  backdrop.style.display = 'flex';
+  $('#modalCancel').onclick = () => { backdrop.style.display = 'none'; };
+  $('#enhanceGo').onclick = () => runEnhance(name, image);
+}
+
+async function runEnhance(name, image){
+  const btn = $('#enhanceGo'); btn.disabled = true; btn.textContent = 'Generating (4x, may take a minute)…';
+  $('#enhanceResults').innerHTML = '';
+  try{
+    const prompt = $('#enhancePrompt').value.trim();
+    const res = await post(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}`, {prompt});
+    $('#enhanceResults').innerHTML = res.candidates.map(c=>{
+      const src = `/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}/candidate/${encodeURIComponent(c)}?t=${encodeURIComponent(TOKEN)}`;
+      return `<div style="display:inline-block;width:23%;margin:0 1% 8px 0;vertical-align:top">
+        <img src="${src}" style="width:100%;border-radius:8px;cursor:pointer;display:block" onclick="lightbox('${src}')">
+        <button type="button" class="small" style="width:100%;margin-top:4px" onclick="acceptEnhance('${name}','${image}','${c}')">Use this one</button>
+      </div>`;
+    }).join('') || '<div class="empty">No candidates produced.</div>';
+  }catch(e){ toast(e.message); }
+  btn.disabled = false; btn.textContent = 'Generate 4 candidates';
+}
+
+async function acceptEnhance(name, image, candidate){
+  try{
+    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}/accept`, {candidate});
+    toast('Dataset image updated.');
+    $('#modalBackdrop').style.display = 'none';
+    renderItems(name);
+  }catch(e){ toast(e.message); }
 }
 
 async function saveCaption(name, el){

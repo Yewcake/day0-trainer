@@ -26,6 +26,8 @@ from pathlib import Path
 import requests
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+from . import enhance
 from PIL import Image
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -92,10 +94,13 @@ def dataset_dir(name: str) -> Path:
     return path
 
 
+DATASET_CACHE_DIRS = {".thumbs", ".enhance"}
+
+
 def dataset_images(path: Path) -> list[Path]:
     return sorted(
         p for p in path.rglob("*")
-        if p.suffix.lower() in IMAGE_EXTS and ".thumbs" not in p.relative_to(path).parts
+        if p.suffix.lower() in IMAGE_EXTS and DATASET_CACHE_DIRS.isdisjoint(p.relative_to(path).parts)
     )
 
 
@@ -379,6 +384,73 @@ def set_caption(name: str, image: str, payload: dict) -> dict:
     if not source.is_file():
         raise HTTPException(status_code=404, detail="Image not found.")
     source.with_suffix(".txt").write_text(str(payload.get("caption", "")).strip(), encoding="utf-8")
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Optional image enhancement (Flux.2 Klein via a trimmed ComfyUI graph).
+# Nothing downloads until /api/enhance/setup is explicitly called.
+# --------------------------------------------------------------------------
+@app.get("/api/enhance/status", dependencies=[Depends(require_auth)])
+def enhance_status() -> dict:
+    return enhance.get_status()
+
+
+@app.post("/api/enhance/setup", dependencies=[Depends(require_auth)])
+def enhance_setup() -> dict:
+    status = enhance.get_status()["status"]
+    if status in ("cloning", "installing", "downloading", "starting"):
+        raise HTTPException(status_code=409, detail="Setup already in progress.")
+    if status == "ready":
+        return {"status": "ready"}
+    hf_token = load_settings().get("hf_token") or os.environ.get("HF_TOKEN", "")
+    threading.Thread(target=enhance.setup_enhance, args=(hf_token,), daemon=True).start()
+    return {"status": "starting"}
+
+
+@app.get("/api/enhance/default_prompt", dependencies=[Depends(require_auth)])
+def enhance_default_prompt() -> dict:
+    return {"prompt": enhance.DEFAULT_ENHANCE_PROMPT}
+
+
+@app.post("/api/datasets/{name}/enhance/{image}", dependencies=[Depends(require_auth)])
+def enhance_image(name: str, image: str, payload: dict) -> dict:
+    if not enhance.is_ready():
+        raise HTTPException(status_code=409, detail="Enhance isn't set up yet.")
+    source = dataset_dir(name) / safe_name(image)
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="Image not found.")
+    prompt = str(payload.get("prompt") or enhance.DEFAULT_ENHANCE_PROMPT)
+    out_dir = dataset_dir(name) / ".enhance" / safe_name(image)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    try:
+        candidates = enhance.run_enhance(source, prompt, 4, out_dir)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Enhance failed: {exc}")
+    return {"candidates": [c.name for c in candidates]}
+
+
+@app.get("/api/datasets/{name}/enhance/{image}/candidate/{filename}", dependencies=[Depends(require_auth)])
+def enhance_candidate(name: str, image: str, filename: str) -> FileResponse:
+    path = dataset_dir(name) / ".enhance" / safe_name(image) / safe_name(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+    return FileResponse(path)
+
+
+@app.post("/api/datasets/{name}/enhance/{image}/accept", dependencies=[Depends(require_auth)])
+def enhance_accept(name: str, image: str, payload: dict) -> dict:
+    source = dataset_dir(name) / safe_name(image)
+    candidate = dataset_dir(name) / ".enhance" / safe_name(image) / safe_name(str(payload.get("candidate", "")))
+    if not source.is_file() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Image or candidate not found.")
+    shutil.copy2(candidate, source)
+    thumb_dir = dataset_dir(name) / ".thumbs"
+    if thumb_dir.is_dir():
+        for stale in thumb_dir.glob(f"*_{source.name}.jpg"):
+            stale.unlink(missing_ok=True)
+    shutil.rmtree(candidate.parent, ignore_errors=True)
     return {"ok": True}
 
 
