@@ -74,9 +74,24 @@
   .dropzone{border:2px dashed var(--line);border-radius:12px;padding:34px;text-align:center;color:var(--muted);cursor:pointer}
   .dropzone.drag{border-color:var(--accent);color:var(--accent);background:var(--panel-2)}
   .dsgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
-  .dsitem{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .dsitem{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .dsitem img{width:100%;height:170px;object-fit:cover;display:block}
   .dsitem textarea{border:none;border-top:1px solid var(--line);border-radius:0;min-height:74px;font-size:11.5px;background:var(--panel)}
+  .dsitem .selchk{position:absolute;top:8px;left:8px;width:20px;height:20px;z-index:2;cursor:pointer;accent-color:var(--accent)}
+  .enh-panel{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:14px;margin-bottom:16px;display:none}
+  .enh-panel textarea{width:100%;min-height:60px;margin-bottom:8px}
+  .enh-row{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--line)}
+  .enh-row:first-of-type{border-top:none}
+  .enh-orig{flex:0 0 110px}
+  .enh-orig img{width:110px;height:110px;object-fit:cover;border-radius:8px;display:block}
+  .enh-orig .hint{margin-top:4px;word-break:break-all}
+  .enh-arrow{flex:0 0 auto;color:var(--muted);font-size:20px;padding-top:40px}
+  .enh-cands{flex:1;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start}
+  .enh-cand{width:140px}
+  .enh-cand img{width:140px;height:140px;object-fit:cover;border-radius:8px;cursor:pointer;display:block}
+  .enh-cand button{width:100%;margin-top:4px}
+  .enh-placeholder{width:140px;height:140px;border-radius:8px;background:var(--panel-2);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:8px}
+  .enh-row-actions{flex:0 0 auto;display:flex;flex-direction:column;gap:6px;padding-top:6px}
   .progressbar{height:8px;background:var(--panel-2);border-radius:4px;overflow:hidden}
   .progressbar>div{height:100%;background:var(--accent);width:0%}
   .lightbox{position:fixed;inset:0;background:rgba(8,7,12,.92);display:none;align-items:center;justify-content:center;z-index:10;cursor:zoom-out}
@@ -116,7 +131,7 @@
 <script>
 const $ = s => document.querySelector(s);
 let TOKEN = localStorage.getItem('day0_token') || '';
-let currentJob = null, pollTimer = null, capTimer = null;
+let currentJob = null, pollTimer = null, capTimer = null, enhanceTimer = null;
 
 const theme = localStorage.getItem('day0_theme') ||
   (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
@@ -190,8 +205,9 @@ const api = async (path, opts={}) => {
 };
 const post = (p,b) => api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
 const put  = (p,b) => api(p,{method:'PUT', headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+const del  = (p)   => api(p,{method:'DELETE'});
 const toast = m => { const t=$('#toast'); t.textContent=m; t.style.display='block'; setTimeout(()=>t.style.display='none',3800); };
-const stopPolling = () => { clearInterval(pollTimer); clearInterval(capTimer); };
+const stopPolling = () => { clearInterval(pollTimer); clearInterval(capTimer); clearInterval(enhanceTimer); };
 const setNav = id => { document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active')); if(id) $(id)?.classList.add('active'); };
 
 async function refreshJobs(){
@@ -508,6 +524,7 @@ async function deleteDataset(name){
 
 async function openDataset(name){
   clearInterval(capTimer);
+  clearInterval(enhanceTimer);
   const def = await api('/api/caption-default-instruction');
   $('#dsdetail').innerHTML = `
     <h3>Captioner — ${name}</h3>
@@ -527,11 +544,19 @@ async function openDataset(name){
         <span class="hint" id="cap_stat">idle</span></div>
     </div>
     <div class="toolbar" style="margin-top:16px;margin-bottom:0"><h3 style="margin:0">Images</h3>
+      <span class="hint" id="selCount">0 selected</span>
       <div class="spacer"></div>
+      <button type="button" onclick="enhanceSelected('${name}')">✦ Enhance selected</button>
       <button type="button" class="primary" onclick="saveAllCaptions('${name}')">Save dataset</button></div>
+    <div class="enh-panel" id="enhancePanel">
+      <div class="modal-title" style="margin-bottom:8px">Enhance queue</div>
+      <textarea id="enhancePrompt" placeholder="enhancement prompt"></textarea>
+      <div id="enhanceRows"></div>
+    </div>
     <div class="dsgrid" id="dsgrid"></div>`;
   loadGeminiModels(true);
   renderItems(name);
+  initEnhancePanel(name);
 }
 
 async function loadGeminiModels(silent){
@@ -548,21 +573,58 @@ async function renderItems(name){
   const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
   $('#dsgrid').innerHTML = items.map(it=>{
     const src = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
-    return `<div class="dsitem"><img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
+    return `<div class="dsitem">
+      <input type="checkbox" class="selchk" data-image="${escHtml(it.image)}" onchange="updateSelCount()">
+      <img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
       <textarea placeholder="no caption" data-image="${escHtml(it.image)}" data-saved="${escHtml(it.caption)}"
         onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea>
       <div style="padding:0 8px 8px"><button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button></div></div>`;
   }).join('') || '<div class="empty">No images.</div>';
+  updateSelCount();
+}
+
+function updateSelCount(){
+  const n = document.querySelectorAll('#dsgrid .selchk:checked').length;
+  const el = $('#selCount'); if (el) el.textContent = `${n} selected`;
 }
 
 /* ---------------- image enhance (Flux.2 Klein, optional) ---------------- */
-async function openEnhance(name, image){
-  const status = await api('/api/enhance/status');
-  if (status.status !== 'ready') showEnhanceSetupModal(name, image, status);
-  else showEnhanceModal(name, image);
+async function initEnhancePanel(name){
+  clearInterval(enhanceTimer);
+  const box = $('#enhancePrompt');
+  if (box && !box.value){
+    try{ const def = await api('/api/enhance/default_prompt'); box.value = def.prompt; }catch(e){ /* ignore */ }
+  }
+  pollEnhanceQueue(name);
+  enhanceTimer = setInterval(()=>pollEnhanceQueue(name), 2500);
 }
 
-function showEnhanceSetupModal(name, image, status){
+async function openEnhance(name, image){
+  await queueEnhanceImages(name, [image]);
+}
+
+async function enhanceSelected(name){
+  const images = [...document.querySelectorAll('#dsgrid .selchk:checked')].map(el=>el.dataset.image);
+  if (!images.length){ toast('Select at least one image first.'); return; }
+  await queueEnhanceImages(name, images);
+}
+
+async function queueEnhanceImages(name, images){
+  let status;
+  try{ status = await api('/api/enhance/status'); }catch(e){ toast(e.message); return; }
+  if (status.status !== 'ready'){ showEnhanceSetupModal(name, images, status); return; }
+  await doQueueEnhance(name, images);
+}
+
+async function doQueueEnhance(name, images){
+  const prompt = ($('#enhancePrompt')?.value || '').trim();
+  try{
+    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`, {images, prompt});
+  }catch(e){ toast(e.message); return; }
+  pollEnhanceQueue(name);
+}
+
+function showEnhanceSetupModal(name, images, status){
   const backdrop = $('#modalBackdrop'), box = $('#modalBox');
   const busy = ['downloading','starting'].includes(status.status);
   box.innerHTML = `<div class="modal-title">Set up image enhancement</div>
@@ -584,12 +646,12 @@ function showEnhanceSetupModal(name, image, status){
   $('#modalOk').onclick = async () => {
     try{ await post('/api/enhance/setup', {}); }catch(e){ toast(e.message); return; }
     $('#modalOk').disabled = true; $('#modalOk').textContent = 'Setting up…';
-    pollEnhanceSetup(name, image);
+    pollEnhanceSetup(name, images);
   };
-  if (busy) pollEnhanceSetup(name, image);
+  if (busy) pollEnhanceSetup(name, images);
 }
 
-async function pollEnhanceSetup(name, image){
+async function pollEnhanceSetup(name, images){
   const timer = setInterval(async ()=>{
     const el = $('#enhanceSetupStatus');
     if (!el){ clearInterval(timer); return; } // modal was closed/replaced
@@ -597,7 +659,8 @@ async function pollEnhanceSetup(name, image){
     el.textContent = `${s.status}${s.detail ? ': '+s.detail : ''}`;
     if (s.status === 'ready'){
       clearInterval(timer);
-      showEnhanceModal(name, image);
+      $('#modalBackdrop').style.display = 'none';
+      await doQueueEnhance(name, images);
     } else if (s.status === 'failed'){
       clearInterval(timer);
       el.textContent = 'Failed: ' + s.error;
@@ -606,43 +669,68 @@ async function pollEnhanceSetup(name, image){
   }, 3000);
 }
 
-async function showEnhanceModal(name, image){
-  const backdrop = $('#modalBackdrop'), box = $('#modalBox');
-  const def = await api('/api/enhance/default_prompt');
-  box.innerHTML = `<div class="modal-title">Enhance ${escHtml(image)}</div>
-    <textarea id="enhancePrompt" style="min-height:80px;width:100%;margin-bottom:10px">${escHtml(def.prompt)}</textarea>
-    <div class="modal-actions">
-      <button type="button" id="modalCancel">Close</button>
-      <button type="button" class="primary" id="enhanceGo">Generate 4 candidates</button>
-    </div>
-    <div id="enhanceResults" style="margin-top:14px"></div>`;
-  backdrop.style.display = 'flex';
-  $('#modalCancel').onclick = () => { backdrop.style.display = 'none'; };
-  $('#enhanceGo').onclick = () => runEnhance(name, image);
+async function pollEnhanceQueue(name){
+  const panel = $('#enhancePanel'), rows = $('#enhanceRows');
+  if (!panel || !rows) return;
+  let items;
+  try{ items = (await api(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`)).items; }
+  catch(e){ return; }
+  panel.style.display = items.length ? 'block' : 'none';
+  rows.innerHTML = items.map(it => renderEnhanceRow(name, it)).join('');
 }
 
-async function runEnhance(name, image){
-  const btn = $('#enhanceGo'); btn.disabled = true; btn.textContent = 'Generating (4x, may take a minute)…';
-  $('#enhanceResults').innerHTML = '';
-  try{
-    const prompt = $('#enhancePrompt').value.trim();
-    const res = await post(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}`, {prompt});
-    $('#enhanceResults').innerHTML = res.candidates.map(c=>{
-      const src = `/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}/candidate/${encodeURIComponent(c)}?t=${encodeURIComponent(TOKEN)}`;
-      return `<div style="display:inline-block;width:23%;margin:0 1% 8px 0;vertical-align:top">
-        <img src="${src}" style="width:100%;border-radius:8px;cursor:pointer;display:block" onclick="lightbox('${src}')">
-        <button type="button" class="small" style="width:100%;margin-top:4px" onclick="acceptEnhance('${name}','${image}','${c}')">Use this one</button>
+function renderEnhanceRow(name, it){
+  const thumb = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
+  let candsHtml;
+  if (it.status === 'done'){
+    candsHtml = it.candidates.map(c=>{
+      const src = `/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(it.image)}/candidate/${encodeURIComponent(c)}?t=${encodeURIComponent(TOKEN)}`;
+      return `<div class="enh-cand">
+        <img src="${src}" onclick="lightbox('${src}')">
+        <button type="button" class="small" onclick="enhanceReplace('${name}','${escHtml(it.image)}','${c}')">Replace original</button>
+        <button type="button" class="small" onclick="enhanceAddNew('${name}','${escHtml(it.image)}','${c}')">Add as new</button>
       </div>`;
-    }).join('') || '<div class="empty">No candidates produced.</div>';
-  }catch(e){ toast(e.message); }
-  btn.disabled = false; btn.textContent = 'Generate 4 candidates';
+    }).join('');
+  } else if (it.status === 'error'){
+    candsHtml = `<div class="enh-placeholder">Failed: ${escHtml(it.error)}</div>`;
+  } else {
+    const label = it.status === 'running' ? 'Generating…' : 'Queued…';
+    candsHtml = Array.from({length: 4}).map(()=>`<div class="enh-placeholder">${label}</div>`).join('');
+  }
+  return `<div class="enh-row">
+    <div class="enh-orig"><img src="${thumb}"><div class="hint">${escHtml(it.image)}</div></div>
+    <div class="enh-arrow">&rarr;</div>
+    <div class="enh-cands">${candsHtml}</div>
+    <div class="enh-row-actions">
+      <button type="button" class="small" onclick="enhanceRegenerate('${name}','${escHtml(it.image)}')" ${it.status==='running'?'disabled':''}>Regenerate</button>
+      <button type="button" class="small" onclick="enhanceSkip('${name}','${escHtml(it.image)}')">Skip</button>
+    </div>
+  </div>`;
 }
 
-async function acceptEnhance(name, image, candidate){
+async function enhanceRegenerate(name, image){
+  await doQueueEnhance(name, [image]);
+}
+
+async function enhanceSkip(name, image){
+  try{ await del(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}`); }
+  catch(e){ toast(e.message); return; }
+  pollEnhanceQueue(name);
+}
+
+async function enhanceReplace(name, image, candidate){
   try{
     await post(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}/accept`, {candidate});
-    toast('Dataset image updated.');
-    $('#modalBackdrop').style.display = 'none';
+    toast('Dataset image replaced.');
+    renderItems(name);
+    pollEnhanceQueue(name);
+  }catch(e){ toast(e.message); }
+}
+
+async function enhanceAddNew(name, image, candidate){
+  try{
+    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}/promote`, {candidate});
+    toast('Added as a new dataset image.');
     renderItems(name);
   }catch(e){ toast(e.message); }
 }

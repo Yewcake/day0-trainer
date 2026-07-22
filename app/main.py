@@ -391,10 +391,58 @@ def set_caption(name: str, image: str, payload: dict) -> dict:
 # Optional image enhancement (diffusers' native Flux2KleinPipeline).
 # Nothing downloads until /api/enhance/setup is explicitly called. Shares the
 # GPU with training, so both guard against the other being active.
+#
+# Generation is queued and processed by a single background worker rather
+# than run inline in the request -- 4 candidates take 2-4 minutes, long
+# enough that RunPod's HTTP proxy kills the connection mid-request. The
+# client polls /enhance/queue instead of waiting on one long POST.
 # --------------------------------------------------------------------------
 def _training_active() -> bool:
     reap_finished()
     return any(proc.poll() is None for proc in _active.values())
+
+
+_enhance_queue_lock = threading.Lock()
+_enhance_queue: dict[str, dict] = {}  # f"{dataset}::{image}" -> row state
+_enhance_worker_active = False
+_enhance_order_counter = 0
+
+
+def _enhance_run_worker() -> None:
+    global _enhance_worker_active
+    while True:
+        with _enhance_queue_lock:
+            pending = sorted(
+                (v for v in _enhance_queue.values() if v["status"] == "queued"),
+                key=lambda v: v["order"],
+            )
+            item = pending[0] if pending else None
+            if item is None:
+                _enhance_worker_active = False
+                return
+            item["status"] = "running"
+        try:
+            source = dataset_dir(item["dataset"]) / safe_name(item["image"])
+            out_dir = dataset_dir(item["dataset"]) / ".enhance" / safe_name(item["image"])
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            candidates = enhance.run_enhance(source, item["prompt"], 4, out_dir)
+            with _enhance_queue_lock:
+                item["status"] = "done"
+                item["candidates"] = [c.name for c in candidates]
+        except Exception as exc:
+            with _enhance_queue_lock:
+                item["status"] = "error"
+                item["error"] = str(exc)
+
+
+def _enhance_ensure_worker() -> None:
+    global _enhance_worker_active
+    with _enhance_queue_lock:
+        if _enhance_worker_active:
+            return
+        _enhance_worker_active = True
+    threading.Thread(target=_enhance_run_worker, daemon=True).start()
 
 
 @app.get("/api/enhance/status", dependencies=[Depends(require_auth)])
@@ -421,24 +469,49 @@ def enhance_default_prompt() -> dict:
     return {"prompt": enhance.DEFAULT_ENHANCE_PROMPT}
 
 
-@app.post("/api/datasets/{name}/enhance/{image}", dependencies=[Depends(require_auth)])
-def enhance_image(name: str, image: str, payload: dict) -> dict:
+@app.post("/api/datasets/{name}/enhance/queue", dependencies=[Depends(require_auth)])
+def enhance_queue_add(name: str, payload: dict) -> dict:
     if not enhance.is_ready():
         raise HTTPException(status_code=409, detail="Enhance isn't set up yet.")
     if _training_active():
         raise HTTPException(status_code=409, detail="A training job is running -- stop it first, enhance needs the same GPU.")
-    source = dataset_dir(name) / safe_name(image)
-    if not source.is_file():
-        raise HTTPException(status_code=404, detail="Image not found.")
+    images = payload.get("images") or []
+    if not images:
+        raise HTTPException(status_code=400, detail="No images given.")
     prompt = str(payload.get("prompt") or enhance.DEFAULT_ENHANCE_PROMPT)
-    out_dir = dataset_dir(name) / ".enhance" / safe_name(image)
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    try:
-        candidates = enhance.run_enhance(source, prompt, 4, out_dir)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Enhance failed: {exc}")
-    return {"candidates": [c.name for c in candidates]}
+    global _enhance_order_counter
+    queued = []
+    with _enhance_queue_lock:
+        for image in images:
+            source = dataset_dir(name) / safe_name(image)
+            if not source.is_file():
+                continue
+            key = f"{name}::{image}"
+            _enhance_order_counter += 1
+            _enhance_queue[key] = {
+                "dataset": name, "image": image, "status": "queued",
+                "candidates": [], "prompt": prompt, "error": "",
+                "order": _enhance_order_counter,
+            }
+            queued.append(key)
+    _enhance_ensure_worker()
+    return {"queued": queued}
+
+
+@app.get("/api/datasets/{name}/enhance/queue", dependencies=[Depends(require_auth)])
+def enhance_queue_status(name: str) -> dict:
+    with _enhance_queue_lock:
+        items = [dict(v) for v in _enhance_queue.values() if v["dataset"] == name]
+    items.sort(key=lambda v: v["order"])
+    return {"items": items}
+
+
+@app.delete("/api/datasets/{name}/enhance/{image}", dependencies=[Depends(require_auth)])
+def enhance_dismiss(name: str, image: str) -> dict:
+    with _enhance_queue_lock:
+        _enhance_queue.pop(f"{name}::{image}", None)
+    shutil.rmtree(dataset_dir(name) / ".enhance" / safe_name(image), ignore_errors=True)
+    return {"ok": True}
 
 
 @app.get("/api/datasets/{name}/enhance/{image}/candidate/{filename}", dependencies=[Depends(require_auth)])
@@ -461,7 +534,27 @@ def enhance_accept(name: str, image: str, payload: dict) -> dict:
         for stale in thumb_dir.glob(f"*_{source.name}.jpg"):
             stale.unlink(missing_ok=True)
     shutil.rmtree(candidate.parent, ignore_errors=True)
+    with _enhance_queue_lock:
+        _enhance_queue.pop(f"{name}::{image}", None)
     return {"ok": True}
+
+
+@app.post("/api/datasets/{name}/enhance/{image}/promote", dependencies=[Depends(require_auth)])
+def enhance_promote(name: str, image: str, payload: dict) -> dict:
+    source_dir = dataset_dir(name)
+    candidate = source_dir / ".enhance" / safe_name(image) / safe_name(str(payload.get("candidate", "")))
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+    stem, suffix = Path(safe_name(image)).stem, Path(safe_name(image)).suffix
+    n = 1
+    while (source_dir / f"{stem}_enh{n}{suffix}").exists():
+        n += 1
+    dest = source_dir / f"{stem}_enh{n}{suffix}"
+    shutil.copy2(candidate, dest)
+    orig_caption = source_dir / f"{stem}.txt"
+    if orig_caption.is_file():
+        shutil.copy2(orig_caption, source_dir / f"{stem}_enh{n}.txt")
+    return {"ok": True, "filename": dest.name}
 
 
 # --------------------------------------------------------------------------
