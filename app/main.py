@@ -122,7 +122,31 @@ def reap_finished() -> None:
         code = _active[job_id].poll()
         if code is not None:
             _active.pop(job_id, None)
-            set_status(job_id, "finished" if code == 0 else "failed")
+            status = "finished" if code == 0 else "failed"
+            set_status(job_id, status)
+            if status == "finished":
+                maybe_auto_analyze(job_id)
+
+
+def maybe_auto_analyze(job_id: str) -> None:
+    try:
+        config = json.loads((job_dir(job_id) / "config.json").read_text())
+    except Exception:
+        return
+    if not config.get("auto_analyze"):
+        return
+    if (job_dir(job_id) / "analysis.md").exists():
+        return  # already analyzed; avoid duplicate calls if reap_finished runs again
+    if not load_settings().get("gemini_api_key"):
+        return  # no key configured, nothing to do
+
+    def worker() -> None:
+        try:
+            run_analysis(job_id)
+        except Exception as exc:
+            print(f"[auto-analyze] job {job_id} failed: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def gemini_key() -> str:
@@ -482,6 +506,7 @@ def create_job(payload: dict) -> dict:
         "warmup_steps": 100, "target_modules": "identity", "optimizer": "paged_adamw8bit",
         "gradient_checkpointing": 1, "transformer_group_offload": 0, "group_offload_blocks": 1,
         "weight_decay": 0.01, "lokr_decompose_both": 0,
+        "validation_image": "", "validation_prompt": "", "auto_analyze": False,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -521,6 +546,8 @@ def create_job(payload: dict) -> dict:
         "--gradient_checkpointing", str(config["gradient_checkpointing"]),
         "--transformer_group_offload", str(config["transformer_group_offload"]),
         "--group_offload_blocks", str(config["group_offload_blocks"]),
+        "--validation_image", safe_name(str(config["validation_image"])) if str(config["validation_image"]).strip() else "",
+        "--validation_prompt", str(config["validation_prompt"]),
         "--seed", str(config["seed"]),
         "--enable_wandb", "0",
     ]
@@ -641,6 +668,10 @@ def download_checkpoint(job_id: str, step: str) -> FileResponse:
 # --------------------------------------------------------------------------
 @app.post("/api/jobs/{job_id}/analyze", dependencies=[Depends(require_auth)])
 def analyze_job(job_id: str) -> dict:
+    return run_analysis(job_id)
+
+
+def run_analysis(job_id: str) -> dict:
     key = gemini_key()
     model = load_settings().get("gemini_model") or "gemini-2.5-flash"
     directory = job_dir(job_id) / "run"
@@ -649,7 +680,10 @@ def analyze_job(job_id: str) -> dict:
     config = json.loads((job_dir(job_id) / "config.json").read_text())
     status = job_status(job_id)
     last_step = metrics[-1]["step"] if metrics else 0
-    loss_summary = [{"step": p["step"], "loss": p["loss"]} for p in metrics]
+    loss_summary = [
+        {"step": p["step"], "loss": p["loss"]} | ({"val_loss": p["val_loss"]} if p.get("val_loss") is not None else {})
+        for p in metrics
+    ]
 
     run_state = (
         f"This run is still IN PROGRESS: {last_step}/{config.get('steps', '?')} steps so far. "
@@ -657,6 +691,16 @@ def analyze_job(job_id: str) -> dict:
         "suggest changes to settings that already match the config below."
         if status == "running" else
         f"This run has ENDED (status: {status}) at step {last_step}/{config.get('steps', '?')}."
+    )
+
+    has_val_loss = any("val_loss" in p for p in loss_summary)
+    val_note = (
+        " Points with val_loss were measured on a held-out image never seen during training, at "
+        "fixed noise levels/seed each time — that's the reliable convergence signal, trust it over "
+        "the raw per-step loss, which is noisy by nature (single-image batches, random timesteps)."
+        if has_val_loss else
+        " No validation loss was configured for this run, so judge convergence from the loss EMA "
+        "trend and the sample images rather than raw per-step loss, which is inherently noisy."
     )
 
     parts: list[dict] = [{
@@ -669,7 +713,7 @@ def analyze_job(job_id: str) -> dict:
             "pose, artifacting, burned contrast) and pick the 1-2 best candidate checkpoints. "
             "Respond with: (1) best candidate step(s) and why, (2) over/underfitting verdict, "
             "(3) one concrete suggestion for the next run — only if the current config doesn't "
-            "already reflect it. Be concise.\n\n"
+            f"already reflect it. Be concise.{val_note}\n\n"
             f"Run state: {run_state}\n"
             f"Full config: {json.dumps(config)}\n"
             f"Loss curve: {json.dumps(loss_summary)}"

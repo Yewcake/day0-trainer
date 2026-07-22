@@ -86,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--caption_extension", default=".txt")
     parser.add_argument("--cache_dir", default="")
+    parser.add_argument("--validation_image", default="")  # filename in dataset_dir; held out from training
+    parser.add_argument("--validation_prompt", default="")  # falls back to the image's own caption if empty
     parser.add_argument("--gradient_checkpointing", type=int, default=0)
     parser.add_argument("--enable_wandb", type=int, default=0)
     parser.add_argument("--wandb_project", default="krea2-lora")
@@ -384,6 +386,10 @@ def cache_dataset(
     embed_dir.mkdir(parents=True, exist_ok=True)
 
     image_paths = sorted(p for p in Path(args.dataset_dir).iterdir() if p.suffix.lower() in IMAGE_EXTS)
+    validation_name = (args.validation_image or "").strip()
+    if validation_name:
+        # Held out entirely from training so validation loss reflects unseen data.
+        image_paths = [p for p in image_paths if p.name != validation_name]
     if not image_paths:
         raise RuntimeError(f"No images found in {args.dataset_dir}")
 
@@ -440,6 +446,37 @@ def cache_dataset(
     manifest.write_text(json.dumps(image_rows, indent=2), encoding="utf-8")
     cache_info.write_text(json.dumps(expected_info, indent=2), encoding="utf-8")
 
+    if validation_name:
+        val_path = Path(args.dataset_dir) / validation_name
+        if not val_path.is_file():
+            print(f"WARNING: validation image '{validation_name}' not found in dataset; skipping validation.")
+        else:
+            val_dir = cache_dir / "validation"
+            val_dir.mkdir(parents=True, exist_ok=True)
+            val_prompt = (args.validation_prompt or "").strip() or read_caption(val_path, args.trigger_word)
+            with torch.no_grad():
+                raw_image = Image.open(val_path)
+                if int(args.enable_buckets):
+                    bucket_w, bucket_h = choose_bucket_size(raw_image, args)
+                    pixels = resize_to_bucket_tensor(raw_image, bucket_w, bucket_h).unsqueeze(0)
+                else:
+                    pixels = center_crop_resize(raw_image, args.resolution).unsqueeze(0)
+                pixels = pixels.to(device=device, dtype=compute_dtype)
+                try:
+                    encoded = pipe.vae.encode(pixels.unsqueeze(2))
+                    latents = encoded.latent_dist.sample().squeeze(2)
+                except Exception:
+                    encoded = pipe.vae.encode(pixels)
+                    latents = encoded.latent_dist.sample()
+                latents = normalize_vae_latents(pipe.vae, latents).to("cpu", dtype=compute_dtype)
+                hidden, mask = pipe.get_text_hidden_states(val_prompt, device=device)
+                hidden = hidden.to("cpu", dtype=compute_dtype)
+                mask = mask.to("cpu")
+            save_file({"latents": latents}, val_dir / "latents.safetensors")
+            save_file({"prompt_embeds": hidden, "prompt_attention_mask": mask}, val_dir / "embeds.safetensors")
+            (val_dir / "prompt.json").write_text(json.dumps({"image": validation_name, "prompt": val_prompt}), encoding="utf-8")
+            print(f"Cached validation image '{validation_name}' (held out from training).")
+
     if hasattr(pipe.vae, "disable_tiling"):
         try:
             pipe.vae.disable_tiling()
@@ -487,6 +524,73 @@ def collate_cached(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
         "prompt_embeds": torch.cat([item["prompt_embeds"] for item in batch], dim=0),
         "prompt_attention_mask": torch.cat([item["prompt_attention_mask"] for item in batch], dim=0),
     }
+
+
+VALIDATION_SIGMAS = (1.0, 0.75, 0.5, 0.25)
+
+
+def compute_validation_loss(
+    transformer,
+    cache_dir: Path,
+    device: torch.device,
+    compute_dtype: torch.dtype,
+    patch_size: int,
+) -> float | None:
+    """Mean MSE loss on the held-out validation image at fixed noise levels/seeds.
+
+    Deterministic across calls (same image, same noise, same sigmas each time), unlike
+    the per-step training loss which varies with whatever random batch/timestep was
+    sampled -- this is the metric that actually tracks convergence cleanly.
+    """
+    val_dir = cache_dir / "validation"
+    latents_path = val_dir / "latents.safetensors"
+    embeds_path = val_dir / "embeds.safetensors"
+    if not latents_path.is_file() or not embeds_path.is_file():
+        return None
+
+    from safetensors.torch import load_file
+
+    latents = load_file(latents_path)["latents"].to(device=device, dtype=compute_dtype)
+    embed_pack = load_file(embeds_path)
+    prompt_embeds = embed_pack["prompt_embeds"].to(device=device, dtype=compute_dtype)
+    prompt_attention_mask = embed_pack["prompt_attention_mask"].to(device=device)
+
+    _bsz, _channels, latent_h_raw, latent_w_raw = latents.shape
+    latent_h = latent_h_raw // patch_size
+    latent_w = latent_w_raw // patch_size
+    position_ids = make_position_ids(latent_h, latent_w, prompt_embeds.shape[1], device)
+
+    was_training = transformer.training
+    transformer.eval()
+    losses: list[float] = []
+    try:
+        with torch.no_grad():
+            for i, sigma_val in enumerate(VALIDATION_SIGMAS):
+                generator = torch.Generator(device=device).manual_seed(1000 + i)
+                noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+                sigma = torch.full((1, 1, 1, 1), sigma_val, device=device, dtype=latents.dtype)
+                noisy_latents = (1.0 - sigma) * latents + sigma * noise
+                target = noise - latents
+
+                noisy_packed = pack_latents(noisy_latents, patch_size=patch_size)
+                target_packed = pack_latents(target, patch_size=patch_size)
+                timestep = torch.full((1,), sigma_val, device=device, dtype=compute_dtype)
+
+                pred = transformer(
+                    hidden_states=noisy_packed,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=timestep,
+                    position_ids=position_ids,
+                    encoder_attention_mask=prompt_attention_mask,
+                    return_dict=False,
+                )[0]
+                loss = F.mse_loss(pred.float(), target_packed.float(), reduction="mean")
+                losses.append(loss.item())
+    finally:
+        if was_training:
+            transformer.train()
+
+    return sum(losses) / len(losses) if losses else None
 
 
 def maybe_enable_fp8_base(model, enabled: bool) -> None:
@@ -1318,14 +1422,15 @@ def train(args: argparse.Namespace) -> None:
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}", epoch=epoch)
 
+            metrics_row = {"step": global_step, "loss": round(loss.item(), 6), "lr": lr, "epoch": epoch}
+            if global_step % args.save_every_n_steps == 0:
+                val_loss = compute_validation_loss(transformer, cache_dir, device, train_dtype, patch_size)
+                if val_loss is not None:
+                    metrics_row["val_loss"] = round(val_loss, 6)
+
             # Local metrics stream (independent of wandb); the Day0 UI polls this.
             with open(run_dir / "metrics.jsonl", "a", encoding="utf-8") as metrics_file:
-                metrics_file.write(
-                    json.dumps(
-                        {"step": global_step, "loss": round(loss.item(), 6), "lr": lr, "epoch": epoch}
-                    )
-                    + "\n"
-                )
+                metrics_file.write(json.dumps(metrics_row) + "\n")
 
             if use_wandb:
                 stats_after_step = trainable_stats(transformer)

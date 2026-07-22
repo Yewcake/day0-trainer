@@ -221,47 +221,98 @@ async function showTrain(){
         <input id="f_hf" type="password" placeholder="${settings.hf_token_set ? 'Saved token will be used — leave empty' : 'hf_… (needed to download the model)'}">
         <label class="hint" style="display:block;margin-top:4px"><input type="checkbox" id="f_hf_save" style="width:auto;margin-right:6px">Save token for future runs</label>
       </div></div>
-    <div class="row"><label>Dataset</label><select id="f_dataset"></select></div>
+    <div class="row"><label>Dataset</label><select id="f_dataset" onchange="onDatasetChange()"></select></div>
     <div class="row"><label>Trigger word</label><input id="f_trigger" value=""></div>
+    <div class="row"><label>Validation image</label><select id="f_valimage" onchange="onValidationImageChange()"><option value="">None (skip validation)</option></select></div>
+    <div class="row" id="row-valprompt" style="display:none"><label>Validation prompt</label><input id="f_valprompt" value=""></div>
     <div class="row"><label>Network</label><select id="f_network" onchange="$('#jobform').classList.toggle('is-lokr',this.value==='lokr'); if(!$('#f_unlock').checked) applyProvenSettings();">
       <option value="lora">LoRA</option><option value="lokr">LoKr</option></select></div>
-    <div class="row"><label>Advanced settings</label>
-      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_unlock" style="width:auto" onchange="toggleAdvancedLock()">Edit advanced training settings (unchecked = use proven defaults, locked)</label>
+    <div class="row"><label>Settings</label>
+      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_unlock" style="width:auto" onchange="toggleAdvancedLock()">Show and modify training settings</label>
     </div>
-    <div class="row"><label>Rank</label><input id="f_rank" type="number" value="32"></div>
-    <div class="row lokr-only"><label>LoKr factor</label><select id="f_factor">
-      <option value="-1" selected>Auto</option>
-      <option value="4">4</option>
-      <option value="8">8</option>
-      <option value="16">16</option>
-      <option value="32">32</option>
-    </select></div>
-    <div class="row lokr-only"><label>LoKr full rank</label><select id="f_fullrank"><option value="0">No (small files)</option><option value="1">Yes (max quality, huge files)</option></select></div>
-    <div class="row lokr-only"><label>LoKr decompose both</label><select id="f_decompose"><option value="0">No</option><option value="1">Yes</option></select></div>
-    <div class="row"><label>Resolution</label><input id="f_res" type="number" value="1024"></div>
+    <div id="advanced-fields">
+      <div class="row"><label>Rank</label><input id="f_rank" type="number" value="32"></div>
+      <div class="row lokr-only"><label>LoKr factor</label><select id="f_factor">
+        <option value="-1" selected>Auto</option>
+        <option value="4">4</option>
+        <option value="8">8</option>
+        <option value="16">16</option>
+        <option value="32">32</option>
+      </select></div>
+      <div class="row lokr-only"><label>LoKr full rank</label><select id="f_fullrank"><option value="0">No (small files)</option><option value="1">Yes (max quality, huge files)</option></select></div>
+      <div class="row lokr-only"><label>LoKr decompose both</label><select id="f_decompose"><option value="0">No</option><option value="1">Yes</option></select></div>
+      <div class="row"><label>Resolution</label><input id="f_res" type="number" value="1024"></div>
+      <div class="row"><label>Optimizer</label><select id="f_optimizer">
+        <option value="paged_adamw8bit" selected>Paged AdamW 8-bit (default, memory-safe)</option>
+        <option value="adamw8bit">AdamW 8-bit</option>
+        <option value="adamw_fused">AdamW (fused)</option>
+        <option value="adamw">AdamW</option>
+        <option value="automagic">Automagic (adaptive per-parameter LR)</option>
+      </select></div>
+      <div class="row"><label>Learning rate</label><input id="f_lr" value="1e-4"></div>
+      <div class="row"><label>Weight decay</label><input id="f_wd" value="0.01"></div>
+      <div class="row"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1" selected>On (saves VRAM)</option></select></div>
+    </div>
     <div class="row"><label>Steps</label><input id="f_steps" type="number" value="2000"></div>
     <div class="row"><label>Save every</label><input id="f_save" type="number" value="250"></div>
     <div class="row"><label>Sample every</label><input id="f_sample" type="number" value="500"></div>
-    <div class="row"><label>Optimizer</label><select id="f_optimizer">
-      <option value="paged_adamw8bit" selected>Paged AdamW 8-bit (default, memory-safe)</option>
-      <option value="adamw8bit">AdamW 8-bit</option>
-      <option value="adamw_fused">AdamW (fused)</option>
-      <option value="adamw">AdamW</option>
-      <option value="automagic">Automagic (adaptive per-parameter LR)</option>
-    </select></div>
-    <div class="row"><label>Learning rate</label><input id="f_lr" value="1e-4"></div>
-    <div class="row"><label>Weight decay</label><input id="f_wd" value="0.01"></div>
-    <div class="row"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1" selected>On (saves VRAM)</option></select></div>
+    <div class="row"><label>Auto-analyze</label>
+      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_autoanalyze" style="width:auto" checked>Automatically analyze with Gemini when training finishes</label>
+    </div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
     <div style="margin-top:14px"><button class="primary" type="submit">Start training</button></div>
   </form></div>`;
   const sets = await api('/api/datasets');
+  window._datasetSets = sets;
   $('#f_dataset').innerHTML = sets.map(d=>`<option value="${d.name}">${d.name} (${d.images} images, ${d.captioned} captioned)</option>`).join('')
     || '<option value="">— no datasets, add one first —</option>';
-  addPrompt('A realistic smartphone portrait photo of TRIGGER woman, natural expression, daylight, no text.');
-  addPrompt('A candid outdoor selfie photo of TRIGGER woman, relaxed expression, blurred city background, no text.');
+  DEFAULT_PROMPTS.forEach(p => addPrompt(p));
   toggleAdvancedLock();
+  await onDatasetChange();
+}
+
+// Candid/amateur-style prompts on purpose: varied angles, lighting and settings are what
+// actually stress-test identity consistency, unlike a handful of similar polished shots.
+const DEFAULT_PROMPTS = [
+  'A candid smartphone selfie of TRIGGER woman in a bathroom mirror, casual outfit, natural indoor lighting, slightly messy background, no text.',
+  'A candid outdoor photo of TRIGGER woman walking down a city street, casual streetwear, natural daylight, slight motion blur, no text.',
+  'An amateur photo of TRIGGER woman sitting at a coffee shop table holding a cup, soft window light, slight grain, no text.',
+  'A candid gym mirror selfie of TRIGGER woman in workout clothes, phone visible in reflection, gym background, no text.',
+  'A low-quality flash photo of TRIGGER woman at a party with friends blurred in the background, slightly overexposed, no text.',
+];
+
+async function onDatasetChange(){
+  const name = $('#f_dataset').value;
+  if (!name){
+    $('#f_valimage').innerHTML = '<option value="">None (skip validation)</option>';
+    onValidationImageChange();
+    return;
+  }
+  const sets = window._datasetSets || await api('/api/datasets');
+  const entry = sets.find(d => d.name === name);
+  if (entry && entry.images > 0){
+    // ~75 steps/image matches the proven 40-images-to-3000-steps run; scales with dataset size.
+    $('#f_steps').value = Math.max(200, Math.round(entry.images * 75));
+  }
+  try{
+    const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
+    $('#f_valimage').innerHTML = '<option value="">None (skip validation)</option>' +
+      items.map(it=>`<option value="${escHtml(it.image)}">${escHtml(it.image)}</option>`).join('');
+  }catch(e){}
+  onValidationImageChange();
+}
+
+async function onValidationImageChange(){
+  const img = $('#f_valimage').value;
+  $('#row-valprompt').style.display = img ? '' : 'none';
+  if (!img) return;
+  const name = $('#f_dataset').value;
+  try{
+    const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
+    const found = items.find(it => it.image === img);
+    $('#f_valprompt').value = found ? found.caption : '';
+  }catch(e){}
 }
 
 // Settings confirmed working end-to-end on this trainer (fixed the OOM/device-mismatch/
@@ -289,6 +340,7 @@ function applyProvenSettings(){
 
 function toggleAdvancedLock(){
   const unlocked = $('#f_unlock').checked;
+  $('#advanced-fields').style.display = unlocked ? '' : 'none';
   for (const id of LOCKED_FIELD_IDS){
     const el = $('#'+id);
     if (el) el.disabled = !unlocked;
@@ -327,6 +379,8 @@ async function submitJob(ev){
     optimizer: $('#f_optimizer').value,
     learning_rate: $('#f_lr').value, weight_decay:+$('#f_wd').value,
     gradient_checkpointing:+$('#f_gc').value,
+    validation_image: $('#f_valimage').value, validation_prompt: $('#f_valprompt').value.trim(),
+    auto_analyze: $('#f_autoanalyze').checked,
     sample_prompts: prompts,
   };
   try{ const job = await post('/api/jobs', payload); toast('Training started.'); openJob(job.id); }
@@ -563,15 +617,25 @@ async function openJob(id){
       <button class="danger" onclick="stopJob('${id}')">Stop</button>
       <button class="danger" onclick="deleteJob('${id}')">Delete</button></div>
     <div class="card chartwrap"><canvas id="chart" height="250"></canvas>
-      <div class="chart-legend">loss · <b>ema</b></div>
+      <div class="chart-legend">loss · <b>ema</b><span id="chart-legend-val" style="display:none"> · <b style="color:var(--err)">val loss</b></span></div>
       <div class="statline" id="statline"></div></div>
     <div id="analysis"></div>
     <h3>Samples</h3><div class="samples" id="samples"><div class="empty">No samples yet.</div></div>
     <h3>Checkpoints</h3><div id="checkpoints"><div class="empty">No checkpoints yet.</div></div>
     <h3>Log</h3><pre class="log" id="log"></pre>`;
-  const existing = await api(`/api/jobs/${id}/analysis`);
-  if (existing.analysis) $('#analysis').innerHTML = `<h3>Gemini analysis</h3><pre class="analysis">${existing.analysis}</pre>`;
-  const poll = () => { drawMetrics(id); loadSamples(id); loadCheckpoints(id); loadLog(id); };
+  let analysisShown = false;
+  const checkAnalysis = async () => {
+    if (analysisShown) return;
+    const existing = await api(`/api/jobs/${id}/analysis`);
+    if (existing.analysis){
+      $('#analysis').innerHTML = `<h3>Gemini analysis</h3><pre class="analysis">${existing.analysis}</pre>`;
+      analysisShown = true;
+    }
+  };
+  await checkAnalysis();
+  // Auto-analyze runs in the background after training finishes, so keep polling
+  // for it to appear (e.g. "analyze on completion" was checked) until it shows up.
+  const poll = () => { drawMetrics(id); loadSamples(id); loadCheckpoints(id); loadLog(id); checkAnalysis(); };
   poll(); pollTimer = setInterval(poll, 4000);
 }
 
@@ -602,8 +666,12 @@ async function drawMetrics(id){
   canvas.width = W*dpr; canvas.height = H*dpr;
   const ctx = canvas.getContext('2d'); ctx.scale(dpr,dpr); ctx.clearRect(0,0,W,H);
   const loss = pts.map(p=>p.loss), steps = pts.map(p=>p.step), smooth = ema(loss);
+  // val_loss is sparse (only logged at checkpoint cadence) and deterministic (same held-out
+  // image/noise/seed every time), unlike the noisy per-step training loss -- the cleaner signal.
+  const valPoints = pts.map((p,i)=>({i, v:p.val_loss})).filter(p=>p.v!=null && !isNaN(p.v));
   const pad = {l:46,r:10,t:12,b:22};
-  const sorted = [...loss].sort((a,b)=>a-b);
+  const rangeSource = loss.concat(valPoints.map(p=>p.v));
+  const sorted = [...rangeSource].sort((a,b)=>a-b);
   const lo = sorted[0], hi = sorted[Math.floor(sorted.length*0.98)] ?? sorted.at(-1);
   const x = i => pad.l + (W-pad.l-pad.r)*(i/(pts.length-1||1));
   const y = v => pad.t + (H-pad.t-pad.b)*(1-Math.min(1,Math.max(0,(v-lo)/((hi-lo)||1))));
@@ -619,8 +687,18 @@ async function drawMetrics(id){
   loss.forEach((v,i)=> i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v))); ctx.stroke(); ctx.globalAlpha = 1;
   ctx.lineWidth=2; ctx.strokeStyle = css('--accent'); ctx.beginPath();
   smooth.forEach((v,i)=> i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v))); ctx.stroke();
+  if (valPoints.length){
+    ctx.lineWidth=2; ctx.strokeStyle = css('--err'); ctx.beginPath();
+    valPoints.forEach((p,idx)=> idx?ctx.lineTo(x(p.i),y(p.v)):ctx.moveTo(x(p.i),y(p.v))); ctx.stroke();
+    ctx.fillStyle = css('--err');
+    valPoints.forEach(p=>{ ctx.beginPath(); ctx.arc(x(p.i), y(p.v), 2.5, 0, Math.PI*2); ctx.fill(); });
+  }
+  $('#chart-legend-val').style.display = valPoints.length ? '' : 'none';
   const last = pts.at(-1);
-  $('#statline').innerHTML = `step <b>${last.step}</b> · loss <b>${last.loss.toFixed(4)}</b> · ema <b>${smooth.at(-1).toFixed(4)}</b> · lr <b>${Number(last.lr).toExponential(1)}</b> · epoch <b>${last.epoch}</b>`;
+  const lastVal = valPoints.length ? valPoints.at(-1).v : null;
+  $('#statline').innerHTML = `step <b>${last.step}</b> · loss <b>${last.loss.toFixed(4)}</b> · ema <b>${smooth.at(-1).toFixed(4)}</b>` +
+    (lastVal!=null ? ` · val_loss <b>${lastVal.toFixed(4)}</b>` : '') +
+    ` · lr <b>${Number(last.lr).toExponential(1)}</b> · epoch <b>${last.epoch}</b>`;
 }
 
 async function loadSamples(id){
