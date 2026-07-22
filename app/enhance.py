@@ -15,6 +15,7 @@ import os
 import threading
 from pathlib import Path
 
+import requests
 import torch
 from PIL import Image
 
@@ -24,6 +25,17 @@ DEFAULT_ENHANCE_PROMPT = (
     "Enhance skin details and make the image look more realistic, amateur "
     "smartphone snapshot vibe. Keep the same person, pose, outfit, and framing."
 )
+
+# SamsungCam UltraReal -- a realism LoRA trained specifically for Flux.2 Klein 9B-base
+# (https://civitai.com/models/1551668), pushes output away from the smooth/plasticky
+# default look toward phone-camera texture. Pairs directly with the enhance prompt's
+# own "amateur snapshot" goal, so it's loaded alongside the base pipeline at setup time.
+LORA_URL = "https://civitai.com/api/download/models/2777498"
+LORA_FILENAME = "Samsung_fluxklein9b.safetensors"
+LORA_ADAPTER_NAME = "samsungcam_ultrareal"
+DEFAULT_LORA_WEIGHT = 0.8
+WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
+LORA_CACHE_DIR = WORKSPACE / "enhance_lora"
 
 _state_lock = threading.Lock()
 _state = {"status": "not_started", "detail": "", "error": ""}
@@ -47,9 +59,32 @@ def is_ready() -> bool:
     return get_status()["status"] == "ready"
 
 
-def setup_enhance(hf_token: str) -> None:
+def _download_lora(civitai_key: str) -> Path:
+    LORA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = LORA_CACHE_DIR / LORA_FILENAME
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    headers = {"Authorization": f"Bearer {civitai_key}"} if civitai_key else {}
+    tmp = dest.with_suffix(".tmp")
+    with requests.get(LORA_URL, headers=headers, stream=True, timeout=120) as resp:
+        if resp.status_code in (401, 403):
+            raise RuntimeError(
+                f"Civitai returned {resp.status_code} downloading the realism LoRA -- "
+                "add a Civitai API key in Settings (civitai.com -> Account -> API Keys)."
+            )
+        resp.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    f.write(chunk)
+    tmp.rename(dest)
+    return dest
+
+
+def setup_enhance(hf_token: str, civitai_key: str = "") -> None:
     """Runs in a background thread. Downloads (first time only) and loads the
-    pipeline, then keeps it resident in _pipe for subsequent enhance calls."""
+    pipeline plus its realism LoRA, then keeps it resident in _pipe for
+    subsequent enhance calls."""
     global _pipe
     try:
         _set_status("downloading", f"Downloading {MODEL_ID} (first time only, ~18GB)...")
@@ -58,6 +93,10 @@ def setup_enhance(hf_token: str) -> None:
         pipe = Flux2KleinPipeline.from_pretrained(
             MODEL_ID, torch_dtype=torch.bfloat16, token=hf_token or None,
         )
+        _set_status("downloading", "Downloading realism LoRA (SamsungCam UltraReal, ~80MB)...")
+        lora_path = _download_lora(civitai_key)
+        pipe.load_lora_weights(str(lora_path), adapter_name=LORA_ADAPTER_NAME)
+        pipe.set_adapters([LORA_ADAPTER_NAME], adapter_weights=[DEFAULT_LORA_WEIGHT])
         _set_status("starting", "Moving model to GPU...")
         pipe.to("cuda")
         with _pipe_lock:
@@ -96,7 +135,9 @@ def _resize_for_flux(img: Image.Image, max_megapixels: float = 1.0) -> Image.Ima
     return img
 
 
-def run_enhance(image_path: Path, prompt: str, count: int, out_dir: Path) -> list[Path]:
+def run_enhance(
+    image_path: Path, prompt: str, count: int, out_dir: Path, lora_weight: float = DEFAULT_LORA_WEIGHT
+) -> list[Path]:
     if not is_ready():
         raise RuntimeError("Enhance is not set up yet.")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +146,7 @@ def run_enhance(image_path: Path, prompt: str, count: int, out_dir: Path) -> lis
 
     results: list[Path] = []
     with _pipe_lock:
+        _pipe.set_adapters([LORA_ADAPTER_NAME], adapter_weights=[lora_weight])
         for i in range(count):
             seed = int.from_bytes(os.urandom(4), "big")
             generator = torch.Generator(device="cuda").manual_seed(seed)

@@ -564,6 +564,8 @@ async function openDataset(name){
     <div class="enh-panel" id="enhancePanel">
       <div class="modal-title" style="margin-bottom:8px">Enhance queue</div>
       <textarea id="enhancePrompt" placeholder="enhancement prompt"></textarea>
+      <div class="row" style="margin-bottom:8px"><label>Realism LoRA strength</label>
+        <input id="enhanceLoraWeight" type="number" step="0.05" min="0" max="1.5" value="0.8" style="max-width:120px"></div>
       <div id="enhanceRows"></div>
     </div>
     <div class="dsgrid" id="dsgrid"></div>`;
@@ -604,9 +606,13 @@ function updateSelCount(){
 /* ---------------- image enhance (Flux.2 Klein, optional) ---------------- */
 async function initEnhancePanel(name){
   clearInterval(enhanceTimer);
-  const box = $('#enhancePrompt');
+  const box = $('#enhancePrompt'), weightBox = $('#enhanceLoraWeight');
   if (box && !box.value){
-    try{ const def = await api('/api/enhance/default_prompt'); box.value = def.prompt; }catch(e){ /* ignore */ }
+    try{
+      const def = await api('/api/enhance/default_prompt');
+      box.value = def.prompt;
+      if (weightBox) weightBox.value = def.lora_weight;
+    }catch(e){ /* ignore */ }
   }
   pollEnhanceQueue(name);
   enhanceTimer = setInterval(()=>pollEnhanceQueue(name), 2500);
@@ -631,8 +637,9 @@ async function queueEnhanceImages(name, images){
 
 async function doQueueEnhance(name, images){
   const prompt = ($('#enhancePrompt')?.value || '').trim();
+  const lora_weight = parseFloat($('#enhanceLoraWeight')?.value) || 0;
   try{
-    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`, {images, prompt});
+    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`, {images, prompt, lora_weight});
   }catch(e){ toast(e.message); return; }
   pollEnhanceQueue(name);
 }
@@ -642,12 +649,14 @@ function showEnhanceSetupModal(name, images, status){
   const busy = ['downloading','starting'].includes(status.status);
   box.innerHTML = `<div class="modal-title">Set up image enhancement</div>
     <div class="hint" style="margin-bottom:12px;display:block">
-      One-time download of the Flux.2 Klein model (~18GB). It's gated on Hugging Face — log into
-      huggingface.co with the account matching your saved HF token, open
+      One-time download of the Flux.2 Klein model (~18GB) plus a realism LoRA
+      (<a href="https://civitai.com/models/1551668" target="_blank" rel="noopener">SamsungCam UltraReal</a>, ~80MB)
+      trained for it. Klein is gated on Hugging Face — log into huggingface.co with the account matching
+      your saved HF token, open
       <a href="https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B" target="_blank" rel="noopener">black-forest-labs/FLUX.2-klein-base-9B</a>,
       click "Agree" once, and make sure your token has "Read access to contents of all public gated
-      repos you can access" enabled (Settings → Access Tokens). Also uses the same GPU as training,
-      so stop any running job first.
+      repos you can access" enabled (Settings → Access Tokens). If the LoRA download fails with a 401,
+      add a Civitai API key in Settings. Also uses the same GPU as training, so stop any running job first.
     </div>
     <div id="enhanceSetupStatus" class="hint" style="display:block;margin-bottom:12px">${status.status==='failed' ? 'Failed: '+escHtml(status.error) : (status.detail || 'Not started.')}</div>
     <div class="modal-actions">
@@ -937,6 +946,8 @@ async function showSettings(){
       <input id="s_hf" type="password" placeholder="${s.hf_token_set?'saved — enter new value to replace':'hf_…'}"></div>
     <div class="row"><label>Gemini API key</label>
       <input id="s_gem" type="password" placeholder="${s.gemini_key_set?'saved — enter new value to replace':'AI Studio key for captioner + analysis'}"></div>
+    <div class="row"><label>Civitai API key</label>
+      <input id="s_civitai" type="password" placeholder="${s.civitai_key_set?'saved — enter new value to replace':'optional, only needed if the enhance realism LoRA download 401s'}"></div>
     <div class="row"><label>Default Gemini model</label>
       <div style="display:flex;gap:8px"><select id="s_gemmodel" style="flex:1"><option value="${s.gemini_model}">${s.gemini_model||'— save a key, then fetch —'}</option></select>
       <button class="small" type="button" onclick="fetchSettingsModels()">↻ Fetch models</button></div></div>
@@ -956,6 +967,7 @@ async function saveSettings(){
   await put('/api/settings', {
     hf_token: $('#s_hf').value.trim() || undefined,
     gemini_api_key: $('#s_gem').value.trim() || undefined,
+    civitai_api_key: $('#s_civitai').value.trim() || undefined,
     gemini_model: $('#s_gemmodel').value || undefined,
   });
   toast('Settings saved.');

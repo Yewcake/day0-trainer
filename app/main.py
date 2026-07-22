@@ -209,13 +209,14 @@ def get_settings() -> dict:
         "hf_token_set": bool(settings.get("hf_token") or os.environ.get("HF_TOKEN")),
         "gemini_key_set": bool(settings.get("gemini_api_key")),
         "gemini_model": settings.get("gemini_model", ""),
+        "civitai_key_set": bool(settings.get("civitai_api_key") or os.environ.get("CIVITAI_API_KEY")),
     }
 
 
 @app.put("/api/settings", dependencies=[Depends(require_auth)])
 def put_settings(payload: dict) -> dict:
     settings = load_settings()
-    for key in ("hf_token", "gemini_api_key", "gemini_model"):
+    for key in ("hf_token", "gemini_api_key", "gemini_model", "civitai_api_key"):
         if key in payload and payload[key] is not None:
             value = str(payload[key]).strip()
             if value:
@@ -433,7 +434,10 @@ def _enhance_run_worker() -> None:
             out_dir = dataset_dir(item["dataset"]) / ".enhance" / safe_name(item["image"])
             if out_dir.exists():
                 shutil.rmtree(out_dir)
-            candidates = enhance.run_enhance(source, item["prompt"], 4, out_dir)
+            candidates = enhance.run_enhance(
+                source, item["prompt"], 4, out_dir,
+                lora_weight=item.get("lora_weight", enhance.DEFAULT_LORA_WEIGHT),
+            )
             with _enhance_queue_lock:
                 item["status"] = "done"
                 item["candidates"] = [c.name for c in candidates]
@@ -466,14 +470,16 @@ def enhance_setup() -> dict:
         raise HTTPException(status_code=409, detail="Setup already in progress.")
     if status == "ready":
         return {"status": "ready"}
-    hf_token = load_settings().get("hf_token") or os.environ.get("HF_TOKEN", "")
-    threading.Thread(target=enhance.setup_enhance, args=(hf_token,), daemon=True).start()
+    settings = load_settings()
+    hf_token = settings.get("hf_token") or os.environ.get("HF_TOKEN", "")
+    civitai_key = settings.get("civitai_api_key") or os.environ.get("CIVITAI_API_KEY", "")
+    threading.Thread(target=enhance.setup_enhance, args=(hf_token, civitai_key), daemon=True).start()
     return {"status": "starting"}
 
 
 @app.get("/api/enhance/default_prompt", dependencies=[Depends(require_auth)])
 def enhance_default_prompt() -> dict:
-    return {"prompt": enhance.DEFAULT_ENHANCE_PROMPT}
+    return {"prompt": enhance.DEFAULT_ENHANCE_PROMPT, "lora_weight": enhance.DEFAULT_LORA_WEIGHT}
 
 
 @app.post("/api/datasets/{name}/enhance/queue", dependencies=[Depends(require_auth)])
@@ -486,6 +492,10 @@ def enhance_queue_add(name: str, payload: dict) -> dict:
     if not images:
         raise HTTPException(status_code=400, detail="No images given.")
     prompt = str(payload.get("prompt") or enhance.DEFAULT_ENHANCE_PROMPT)
+    try:
+        lora_weight = float(payload.get("lora_weight", enhance.DEFAULT_LORA_WEIGHT))
+    except (TypeError, ValueError):
+        lora_weight = enhance.DEFAULT_LORA_WEIGHT
     global _enhance_order_counter
     queued = []
     with _enhance_queue_lock:
@@ -497,7 +507,7 @@ def enhance_queue_add(name: str, payload: dict) -> dict:
             _enhance_order_counter += 1
             _enhance_queue[key] = {
                 "dataset": name, "image": image, "status": "queued",
-                "candidates": [], "prompt": prompt, "error": "",
+                "candidates": [], "prompt": prompt, "lora_weight": lora_weight, "error": "",
                 "order": _enhance_order_counter,
             }
             queued.append(key)
