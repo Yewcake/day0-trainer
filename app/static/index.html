@@ -238,7 +238,7 @@ async function showTrain(){
         <label class="hint" style="display:block;margin-top:4px"><input type="checkbox" id="f_hf_save" style="width:auto;margin-right:6px">Save token for future runs</label>
       </div></div>
     <div class="row"><label>Dataset</label><select id="f_dataset" onchange="onDatasetChange()"></select></div>
-    <div class="row"><label>Trigger word</label><input id="f_trigger" value=""></div>
+    <div class="row"><label>Trigger word</label><input id="f_trigger" value="" oninput="applyTriggerToPrompts()"></div>
     <div class="row"><label>Validation image</label><select id="f_valimage" onchange="onValidationImageChange()"><option value="">None (skip validation)</option></select></div>
     <div class="row" id="row-valprompt" style="display:none"><label>Validation prompt</label><input id="f_valprompt" value=""></div>
     <div class="row"><label>Network</label><select id="f_network" onchange="$('#jobform').classList.toggle('is-lokr',this.value==='lokr'); if(!$('#f_unlock').checked) applyProvenSettings();">
@@ -286,6 +286,15 @@ async function showTrain(){
   DEFAULT_PROMPTS.forEach(p => addPrompt(p));
   toggleAdvancedLock();
   await onDatasetChange();
+  applyTriggerToPrompts();
+}
+
+function applyTriggerToPrompts(){
+  const trigger = $('#f_trigger').value.trim();
+  if (!trigger) return;
+  document.querySelectorAll('#prompts textarea').forEach(t => {
+    if (t.value.includes('TRIGGER')) t.value = t.value.replaceAll('TRIGGER', trigger);
+  });
 }
 
 // Candid/amateur-style prompts on purpose: varied angles, lighting and settings are what
@@ -311,12 +320,16 @@ async function onDatasetChange(){
     // ~75 steps/image matches the proven 40-images-to-3000-steps run; scales with dataset size.
     $('#f_steps').value = Math.max(200, Math.round(entry.images * 75));
   }
+  if (entry && entry.trigger_word && !$('#f_trigger').value.trim()){
+    $('#f_trigger').value = entry.trigger_word;
+  }
   try{
     const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
     $('#f_valimage').innerHTML = '<option value="">None (skip validation)</option>' +
       items.map(it=>`<option value="${escHtml(it.image)}">${escHtml(it.image)}</option>`).join('');
   }catch(e){}
   onValidationImageChange();
+  applyTriggerToPrompts();
 }
 
 async function onValidationImageChange(){
@@ -336,7 +349,7 @@ async function onValidationImageChange(){
 // doesn't have to rediscover them; the "edit advanced settings" checkbox unlocks them.
 const PROVEN_SETTINGS = {
   lora: {
-    f_rank: '32', f_res: '1024', f_optimizer: 'automagic',
+    f_rank: '32', f_res: '1024', f_optimizer: 'paged_adamw8bit',
     f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
   },
   lokr: {

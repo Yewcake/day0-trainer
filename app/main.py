@@ -294,6 +294,8 @@ def flatten_dataset(target: Path) -> None:
             if caption.exists() and not (target / caption.name).exists():
                 shutil.move(str(caption), target / caption.name)
     for entry in list(target.iterdir()):
+        if entry.name == ".trigger":
+            continue
         if entry.is_dir():
             shutil.rmtree(entry)
         elif entry.suffix.lower() not in IMAGE_EXTS | {".txt"}:
@@ -307,7 +309,12 @@ def list_datasets() -> list[dict]:
         if entry.is_dir():
             images = dataset_images(entry)
             captioned = sum(1 for img in images if img.with_suffix(".txt").exists())
-            out.append({"name": entry.name, "images": len(images), "captioned": captioned})
+            trigger_file = entry / ".trigger"
+            trigger_word = trigger_file.read_text(encoding="utf-8").strip() if trigger_file.exists() else ""
+            out.append({
+                "name": entry.name, "images": len(images), "captioned": captioned,
+                "trigger_word": trigger_word,
+            })
     return out
 
 
@@ -601,6 +608,8 @@ def caption_all(name: str, payload: dict) -> dict:
     instruction = str(payload.get("instruction") or DEFAULT_CAPTION_INSTRUCTION)
     trigger = str(payload.get("trigger_word", "")).strip()
     only_missing = bool(payload.get("only_missing", True))
+    if trigger:
+        (dataset_dir(name) / ".trigger").write_text(trigger, encoding="utf-8")
     _caption_runs[name] = {"status": "starting", "cancel": False}
     thread = threading.Thread(
         target=_caption_worker, args=(name, instruction, model, trigger, only_missing, key), daemon=True
@@ -683,13 +692,15 @@ def create_job(payload: dict) -> dict:
         "model_path": model_entry["default_path"], "resolution": 1024, "steps": 2000,
         "save_every": 250, "sample_every": 500, "sample_steps": 12, "batch_size": 1,
         "rank": 32, "lokr_factor": -1, "lokr_full_rank": 0, "learning_rate": "1e-4",
-        "warmup_steps": 100, "target_modules": "identity", "optimizer": "paged_adamw8bit",
+        "target_modules": "identity", "optimizer": "paged_adamw8bit",
         "gradient_checkpointing": 1, "transformer_group_offload": 0, "group_offload_blocks": 1,
         "weight_decay": 0.01, "lokr_decompose_both": 0,
         "validation_image": "", "validation_prompt": "", "auto_analyze": False,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
+    # 5% warmup matches the proven lora recipe (150 steps for a 3000-step run); scales with step count.
+    config["warmup_steps"] = int(payload["warmup_steps"]) if "warmup_steps" in payload else max(1, round(int(config["steps"]) * 0.05))
     config.update({
         "dataset": dataset, "trigger_word": trigger, "network_type": network,
         "model_id": model_id, "model_label": model_entry["label"], "sample_prompts": prompts,

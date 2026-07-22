@@ -111,8 +111,8 @@ def run_enhance(image_path: Path, prompt: str, count: int, out_dir: Path) -> lis
             out_image = _pipe(
                 prompt=prompt,
                 image=img,
-                num_inference_steps=28,
-                guidance_scale=4.0,
+                num_inference_steps=8,
+                guidance_scale=1.0,
                 height=height,
                 width=width,
                 generator=generator,
