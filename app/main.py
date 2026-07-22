@@ -801,7 +801,8 @@ def delete_job(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}/metrics", dependencies=[Depends(require_auth)])
 def job_metrics(job_id: str, max_points: int = 1200) -> dict:
-    metrics_file = job_dir(job_id) / "run" / "metrics.jsonl"
+    directory = job_dir(job_id)
+    metrics_file = directory / "run" / "metrics.jsonl"
     points: list[dict] = []
     if metrics_file.exists():
         for line in metrics_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -812,7 +813,29 @@ def job_metrics(job_id: str, max_points: int = 1200) -> dict:
     if len(points) > max_points:
         stride = len(points) / max_points
         points = [points[int(i * stride)] for i in range(max_points - 1)] + [points[-1]]
-    return {"status": job_status(job_id), "points": points}
+
+    status = job_status(job_id)
+    config_file = directory / "config.json"
+    total_steps = None
+    started_at = None
+    if config_file.exists():
+        try:
+            total_steps = json.loads(config_file.read_text()).get("steps")
+        except Exception:
+            pass
+        started_at = config_file.stat().st_mtime
+    elapsed_seconds = None
+    if started_at:
+        # Freeze the clock at the last metrics write once the run isn't active anymore,
+        # so reopening a finished job later doesn't show elapsed time still climbing.
+        end_reference = time.time() if status == "running" else (
+            metrics_file.stat().st_mtime if metrics_file.exists() else started_at
+        )
+        elapsed_seconds = max(0.0, end_reference - started_at)
+    return {
+        "status": status, "points": points,
+        "total_steps": total_steps, "elapsed_seconds": elapsed_seconds,
+    }
 
 
 @app.get("/api/jobs/{job_id}/log", dependencies=[Depends(require_auth)])

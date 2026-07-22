@@ -899,9 +899,28 @@ async function drawMetrics(id){
   $('#chart-legend-val').style.display = valPoints.length ? '' : 'none';
   const last = pts.at(-1);
   const lastVal = valPoints.length ? valPoints.at(-1).v : null;
-  $('#statline').innerHTML = `step <b>${last.step}</b> · loss <b>${last.loss.toFixed(4)}</b> · ema <b>${smooth.at(-1).toFixed(4)}</b>` +
+  const stepLabel = data.total_steps ? `${last.step}/${data.total_steps}` : String(last.step);
+  let timerHtml = '';
+  if (data.elapsed_seconds != null){
+    timerHtml = ` · elapsed <b>${formatDuration(data.elapsed_seconds)}</b>`;
+    if (data.status === 'running' && data.total_steps && last.step > 0){
+      const secPerStep = data.elapsed_seconds / last.step;
+      const remaining = secPerStep * Math.max(0, data.total_steps - last.step);
+      timerHtml += ` · ETA <b>${formatDuration(remaining)}</b>`;
+    }
+  }
+  $('#statline').innerHTML = `step <b>${stepLabel}</b> · loss <b>${last.loss.toFixed(4)}</b> · ema <b>${smooth.at(-1).toFixed(4)}</b>` +
     (lastVal!=null ? ` · val_loss <b>${lastVal.toFixed(4)}</b>` : '') +
-    ` · lr <b>${Number(last.lr).toExponential(1)}</b> · epoch <b>${last.epoch}</b>`;
+    ` · lr <b>${Number(last.lr).toExponential(1)}</b> · epoch <b>${last.epoch}</b>` + timerHtml;
+}
+
+function formatDuration(seconds){
+  if (seconds == null || !isFinite(seconds) || seconds < 0) return '—';
+  const s = Math.round(seconds);
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
 }
 
 async function loadSamples(id){
