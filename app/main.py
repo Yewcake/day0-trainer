@@ -364,9 +364,14 @@ def dataset_items(name: str) -> list[dict]:
     out = []
     for image in dataset_images(target):
         caption_file = image.with_suffix(".txt")
+        try:
+            width, height = Image.open(image).size  # header-only read, no full decode
+        except Exception:
+            width, height = None, None
         out.append({
             "image": image.name,
             "caption": caption_file.read_text(encoding="utf-8", errors="replace") if caption_file.exists() else "",
+            "width": width, "height": height,
         })
     return out
 
@@ -392,6 +397,24 @@ def set_caption(name: str, image: str, payload: dict) -> dict:
     if not source.is_file():
         raise HTTPException(status_code=404, detail="Image not found.")
     source.with_suffix(".txt").write_text(str(payload.get("caption", "")).strip(), encoding="utf-8")
+    return {"ok": True}
+
+
+@app.delete("/api/datasets/{name}/images/{image}", dependencies=[Depends(require_auth)])
+def delete_dataset_image(name: str, image: str) -> dict:
+    target = dataset_dir(name)
+    source = target / safe_name(image)
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="Image not found.")
+    source.unlink()
+    source.with_suffix(".txt").unlink(missing_ok=True)
+    thumb_dir = target / ".thumbs"
+    if thumb_dir.is_dir():
+        for stale in thumb_dir.glob(f"*_{source.name}.jpg"):
+            stale.unlink(missing_ok=True)
+    shutil.rmtree(target / ".enhance" / source.name, ignore_errors=True)
+    with _enhance_queue_lock:
+        _enhance_queue.pop(f"{name}::{image}", None)
     return {"ok": True}
 
 
@@ -437,6 +460,7 @@ def _enhance_run_worker() -> None:
             candidates = enhance.run_enhance(
                 source, item["prompt"], item.get("count", 1), out_dir,
                 lora_weight=item.get("lora_weight", enhance.DEFAULT_LORA_WEIGHT),
+                max_megapixels=item.get("max_megapixels", 1.0),
             )
             with _enhance_queue_lock:
                 item["status"] = "done"
@@ -500,6 +524,10 @@ def enhance_queue_add(name: str, payload: dict) -> dict:
         count = max(1, min(4, int(payload.get("count", 1))))
     except (TypeError, ValueError):
         count = 1
+    try:
+        max_megapixels = max(0.5, min(2.0, float(payload.get("max_megapixels", 1.0))))
+    except (TypeError, ValueError):
+        max_megapixels = 1.0
     global _enhance_order_counter
     queued = []
     with _enhance_queue_lock:
@@ -511,7 +539,8 @@ def enhance_queue_add(name: str, payload: dict) -> dict:
             _enhance_order_counter += 1
             _enhance_queue[key] = {
                 "dataset": name, "image": image, "status": "queued", "count": count,
-                "candidates": [], "prompt": prompt, "lora_weight": lora_weight, "error": "",
+                "candidates": [], "prompt": prompt, "lora_weight": lora_weight,
+                "max_megapixels": max_megapixels, "error": "",
                 "order": _enhance_order_counter,
             }
             queued.append(key)
@@ -576,6 +605,44 @@ def enhance_promote(name: str, image: str, payload: dict) -> dict:
     if orig_caption.is_file():
         shutil.copy2(orig_caption, source_dir / f"{stem}_enh{n}.txt")
     return {"ok": True, "filename": dest.name}
+
+
+@app.post("/api/datasets/{name}/enhance/{image}/gemini_pick", dependencies=[Depends(require_auth)])
+def enhance_gemini_pick(name: str, image: str) -> dict:
+    key = gemini_key()
+    model = load_settings().get("gemini_model") or "gemini-2.5-flash"
+    source = dataset_dir(name) / safe_name(image)
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="Image not found.")
+    cand_dir = dataset_dir(name) / ".enhance" / safe_name(image)
+    candidates = sorted(cand_dir.glob("candidate_*.png")) if cand_dir.is_dir() else []
+    if not candidates:
+        raise HTTPException(status_code=400, detail="No candidates to analyze yet.")
+
+    parts: list[dict] = [{
+        "text": (
+            "You are judging AI-enhanced versions of a training-dataset photo. The goal of the "
+            "enhancement is to make skin/texture look more like a real amateur phone photo -- NOT "
+            "smooth, plastic, or AI-looking -- while keeping the same person, pose, outfit, and "
+            f"framing as the original. Below is the ORIGINAL image, followed by {len(candidates)} "
+            "candidate(s), each labelled by filename. Pick the single best candidate, or say none "
+            "are good and the original should be kept. Watch for identity drift, warped anatomy, "
+            "changed pose/outfit, or over-smoothing that undoes the point of the enhancement. "
+            "Respond with the winning candidate's exact filename (or 'none') on the first line, "
+            "then one or two sentences why."
+        )
+    }]
+    parts.append({"text": "ORIGINAL:"})
+    parts.append(encode_image_for_gemini(source, max_side=768))
+    for cand in candidates:
+        parts.append({"text": f"{cand.name}:"})
+        parts.append(encode_image_for_gemini(cand, max_side=768))
+
+    try:
+        verdict = gemini_generate(model, parts, key, timeout=90)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"analysis": verdict, "model": model}
 
 
 # --------------------------------------------------------------------------

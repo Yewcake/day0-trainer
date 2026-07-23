@@ -177,8 +177,10 @@ def unload() -> None:
 
 
 def _resize_for_flux(img: Image.Image, max_megapixels: float = 1.0) -> Image.Image:
+    # No min(1.0, ...) cap -- letting this scale up too is what makes the "output size"
+    # option in the UI able to upscale a smaller original toward the requested megapixels.
     w, h = img.size
-    scale = min(1.0, (max_megapixels * 1_000_000 / (w * h)) ** 0.5)
+    scale = (max_megapixels * 1_000_000 / (w * h)) ** 0.5
     new_w = max(16, round(w * scale / 16) * 16)
     new_h = max(16, round(h * scale / 16) * 16)
     if (new_w, new_h) != (w, h):
@@ -187,12 +189,13 @@ def _resize_for_flux(img: Image.Image, max_megapixels: float = 1.0) -> Image.Ima
 
 
 def run_enhance(
-    image_path: Path, prompt: str, count: int, out_dir: Path, lora_weight: float = DEFAULT_LORA_WEIGHT
+    image_path: Path, prompt: str, count: int, out_dir: Path,
+    lora_weight: float = DEFAULT_LORA_WEIGHT, max_megapixels: float = 1.0,
 ) -> list[Path]:
     if not is_ready():
         raise RuntimeError("Enhance is not set up yet.")
     out_dir.mkdir(parents=True, exist_ok=True)
-    img = _resize_for_flux(Image.open(image_path).convert("RGB"))
+    img = _resize_for_flux(Image.open(image_path).convert("RGB"), max_megapixels)
     width, height = img.size
 
     results: list[Path] = []

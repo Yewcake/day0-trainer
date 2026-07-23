@@ -80,18 +80,24 @@
   .dsitem .selchk{position:absolute;top:8px;left:8px;width:20px;height:20px;z-index:2;cursor:pointer;accent-color:var(--accent)}
   .enh-panel{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:14px;margin-bottom:16px;display:none}
   .enh-panel textarea{width:100%;min-height:60px;margin-bottom:8px}
-  .enh-row{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--line)}
-  .enh-row:first-of-type{border-top:none}
+  .enh-row-wrap{border-top:1px solid var(--line);padding:10px 0}
+  .enh-row-wrap:first-child{border-top:none}
+  .enh-row{display:flex;gap:12px;align-items:flex-start}
   .enh-orig{flex:0 0 110px}
   .enh-orig img{width:110px;height:110px;object-fit:cover;border-radius:8px;display:block}
   .enh-orig .hint{margin-top:4px;word-break:break-all}
   .enh-arrow{flex:0 0 auto;color:var(--muted);font-size:20px;padding-top:40px}
   .enh-cands{flex:1;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start}
   .enh-cand{width:140px}
-  .enh-cand img{width:140px;height:140px;object-fit:cover;border-radius:8px;cursor:pointer;display:block}
   .enh-cand button{width:100%;margin-top:4px}
+  .enh-cand .hint{margin-top:2px;font-size:10.5px}
   .enh-placeholder{width:140px;height:140px;border-radius:8px;background:var(--panel-2);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:8px}
   .enh-row-actions{flex:0 0 auto;display:flex;flex-direction:column;gap:6px;padding-top:6px}
+  .ba-wrap{position:relative;width:140px;height:140px;border-radius:8px;overflow:hidden;background:var(--panel-2)}
+  .ba-wrap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;cursor:pointer}
+  .ba-after{clip-path:inset(0 50% 0 0)}
+  .ba-range{width:140px;margin-top:4px;display:block}
+  .enh-analysis{margin-top:8px;padding:8px 10px;background:var(--panel-2);border-radius:8px;font-size:12.5px;white-space:pre-wrap}
   .progressbar{height:8px;background:var(--panel-2);border-radius:4px;overflow:hidden}
   .progressbar>div{height:100%;background:var(--accent);width:0%}
   .lightbox{position:fixed;inset:0;background:rgba(8,7,12,.92);display:none;align-items:center;justify-content:center;z-index:10;cursor:zoom-out}
@@ -569,6 +575,12 @@ async function openDataset(name){
         <input id="enhanceLoraWeight" type="number" step="0.05" min="0" max="1.5" value="0.8" style="max-width:120px"></div>
       <div class="row" style="margin-bottom:8px"><label>Candidates per image</label>
         <input id="enhanceCount" type="number" min="1" max="4" value="1" style="max-width:120px"></div>
+      <div class="row" style="margin-bottom:8px"><label>Output size</label>
+        <select id="enhanceMegapixels" style="max-width:200px">
+          <option value="1">1 MP (fastest)</option>
+          <option value="1.5">1.5 MP</option>
+          <option value="2">2 MP (upscale, slower)</option>
+        </select></div>
       <div id="enhanceRows"></div>
     </div>
     <div class="dsgrid" id="dsgrid"></div>`;
@@ -587,18 +599,35 @@ async function loadGeminiModels(silent){
 
 const escHtml = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
 
+let _dsItemsCache = [];
+
 async function renderItems(name){
   const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
+  _dsItemsCache = items;
   $('#dsgrid').innerHTML = items.map(it=>{
     const src = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
+    const dims = (it.width && it.height) ? `${it.width}×${it.height} (${(it.width*it.height/1e6).toFixed(2)}MP)` : '';
     return `<div class="dsitem">
       <input type="checkbox" class="selchk" data-image="${escHtml(it.image)}" onchange="updateSelCount()">
       <img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
       <textarea placeholder="no caption" data-image="${escHtml(it.image)}" data-saved="${escHtml(it.caption)}"
         onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea>
-      <div style="padding:0 8px 8px"><button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button></div></div>`;
+      <div class="hint" style="padding:0 8px">${dims}</div>
+      <div style="padding:6px 8px 8px;display:flex;gap:6px">
+        <button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button>
+        <button type="button" class="small danger" onclick="deleteImage('${name}','${escHtml(it.image)}')">🗑</button>
+      </div></div>`;
   }).join('') || '<div class="empty">No images.</div>';
   updateSelCount();
+}
+
+async function deleteImage(name, image){
+  if (!(await modalConfirm(`Delete '${image}' from this dataset? This can't be undone.`))) return;
+  try{
+    await del(`/api/datasets/${encodeURIComponent(name)}/images/${encodeURIComponent(image)}`);
+    toast('Image deleted.');
+    renderItems(name);
+  }catch(e){ toast(e.message); }
 }
 
 function updateSelCount(){
@@ -650,8 +679,9 @@ async function doQueueEnhance(name, images){
   const prompt = ($('#enhancePrompt')?.value || '').trim();
   const lora_weight = parseFloat($('#enhanceLoraWeight')?.value) || 0;
   const count = parseInt($('#enhanceCount')?.value) || 1;
+  const max_megapixels = parseFloat($('#enhanceMegapixels')?.value) || 1;
   try{
-    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`, {images, prompt, lora_weight, count});
+    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`, {images, prompt, lora_weight, count, max_megapixels});
   }catch(e){ toast(e.message); return; }
   pollEnhanceQueue(name);
 }
@@ -707,6 +737,8 @@ async function pollEnhanceSetup(name, images){
   }, 3000);
 }
 
+let _enhanceAnalysisCache = {};
+
 async function pollEnhanceQueue(name){
   const panel = $('#enhancePanel'), rows = $('#enhanceRows');
   if (!panel || !rows) return;
@@ -717,14 +749,26 @@ async function pollEnhanceQueue(name){
   rows.innerHTML = items.map(it => renderEnhanceRow(name, it)).join('');
 }
 
+function dimsLabel(w, h){
+  return (w && h) ? `${w}×${h} (${(w*h/1e6).toFixed(2)}MP)` : '';
+}
+
 function renderEnhanceRow(name, it){
   const thumb = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
+  const dsItem = _dsItemsCache.find(d => d.image === it.image);
+  const origDims = dsItem ? dimsLabel(dsItem.width, dsItem.height) : '';
   let candsHtml;
   if (it.status === 'done'){
     candsHtml = it.candidates.map(c=>{
       const src = `/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(it.image)}/candidate/${encodeURIComponent(c)}?t=${encodeURIComponent(TOKEN)}`;
       return `<div class="enh-cand">
-        <img src="${src}" onclick="lightbox('${src}')">
+        <div class="ba-wrap">
+          <img class="ba-before" src="${thumb}">
+          <img class="ba-after" src="${src}" onclick="lightbox('${src}')"
+            onload="this.closest('.enh-cand').querySelector('.enh-cand-dims').textContent=dimsLabel(this.naturalWidth,this.naturalHeight)">
+        </div>
+        <input type="range" class="ba-range" min="0" max="100" value="50" oninput="baSlide(this)">
+        <div class="hint enh-cand-dims"></div>
         <button type="button" class="small" onclick="enhanceReplace('${name}','${escHtml(it.image)}','${c}')">Replace original</button>
         <button type="button" class="small" onclick="enhanceAddNew('${name}','${escHtml(it.image)}','${c}')">Add as new</button>
       </div>`;
@@ -735,24 +779,47 @@ function renderEnhanceRow(name, it){
     const label = it.status === 'running' ? 'Generating…' : 'Queued…';
     candsHtml = Array.from({length: it.count || 1}).map(()=>`<div class="enh-placeholder">${label}</div>`).join('');
   }
-  return `<div class="enh-row">
-    <div class="enh-orig"><img src="${thumb}"><div class="hint">${escHtml(it.image)}</div></div>
-    <div class="enh-arrow">&rarr;</div>
-    <div class="enh-cands">${candsHtml}</div>
-    <div class="enh-row-actions">
-      <button type="button" class="small" onclick="enhanceRegenerate('${name}','${escHtml(it.image)}')" ${it.status==='running'?'disabled':''}>Regenerate</button>
-      <button type="button" class="small" onclick="enhanceSkip('${name}','${escHtml(it.image)}')">Skip</button>
+  const cachedAnalysis = _enhanceAnalysisCache[`${name}::${it.image}`];
+  const analysisHtml = cachedAnalysis ? `<div class="enh-analysis">${escHtml(cachedAnalysis)}</div>` : '';
+  return `<div class="enh-row-wrap">
+    <div class="enh-row">
+      <div class="enh-orig"><img src="${thumb}"><div class="hint">${escHtml(it.image)}</div><div class="hint">${origDims}</div></div>
+      <div class="enh-arrow">&rarr;</div>
+      <div class="enh-cands">${candsHtml}</div>
+      <div class="enh-row-actions">
+        <button type="button" class="small" onclick="enhanceRegenerate('${name}','${escHtml(it.image)}')" ${it.status==='running'?'disabled':''}>Regenerate</button>
+        <button type="button" class="small" onclick="enhanceSkip('${name}','${escHtml(it.image)}')">Skip</button>
+        ${it.status==='done' ? `<button type="button" class="small" onclick="enhanceGeminiPick('${name}','${escHtml(it.image)}')">✦ Analyze</button>` : ''}
+      </div>
     </div>
+    ${analysisHtml}
   </div>`;
 }
 
+function baSlide(range){
+  const after = range.closest('.enh-cand').querySelector('.ba-after');
+  if (after) after.style.clipPath = `inset(0 ${100-range.value}% 0 0)`;
+}
+
 async function enhanceRegenerate(name, image){
+  delete _enhanceAnalysisCache[`${name}::${image}`];
   await doQueueEnhance(name, [image]);
+}
+
+async function enhanceGeminiPick(name, image){
+  toast('Sending to Gemini…');
+  try{
+    const res = await post(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}/gemini_pick`, {});
+    const key = `${name}::${image}`;
+    _enhanceAnalysisCache[key] = res.analysis;
+    await pollEnhanceQueue(name);
+  }catch(e){ toast(e.message); }
 }
 
 async function enhanceSkip(name, image){
   try{ await del(`/api/datasets/${encodeURIComponent(name)}/enhance/${encodeURIComponent(image)}`); }
   catch(e){ toast(e.message); return; }
+  delete _enhanceAnalysisCache[`${name}::${image}`];
   pollEnhanceQueue(name);
 }
 
