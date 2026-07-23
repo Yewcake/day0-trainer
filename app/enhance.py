@@ -36,9 +36,10 @@ LORA_ADAPTER_NAME = "samsungcam_ultrareal"
 DEFAULT_LORA_WEIGHT = 0.8
 WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 LORA_CACHE_DIR = WORKSPACE / "enhance_lora"
+MODEL_APPROX_BYTES = 18 * 1024 ** 3  # rough, just to turn "bytes on disk" into a percentage
 
 _state_lock = threading.Lock()
-_state = {"status": "not_started", "detail": "", "error": ""}
+_state = {"status": "not_started", "detail": "", "error": "", "pct": None}
 _pipe = None
 _pipe_lock = threading.Lock()
 
@@ -48,15 +49,46 @@ def get_status() -> dict:
         return dict(_state)
 
 
-def _set_status(status: str, detail: str = "", error: str = "") -> None:
+def _set_status(status: str, detail: str = "", error: str = "", pct: float | None = None) -> None:
     with _state_lock:
         _state["status"] = status
         _state["detail"] = detail
         _state["error"] = error
+        _state["pct"] = pct
 
 
 def is_ready() -> bool:
     return get_status()["status"] == "ready"
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    if path.is_dir():
+        for entry in path.rglob("*"):
+            if entry.is_file() and not entry.is_symlink():
+                try:
+                    total += entry.stat().st_size
+                except OSError:
+                    pass
+    return total
+
+
+def _hf_cache_blobs_dir(repo_id: str) -> Path:
+    from huggingface_hub import constants as hf_constants
+
+    return Path(hf_constants.HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--")) / "blobs"
+
+
+def _watch_model_download(stop_event: threading.Event) -> None:
+    """Polls actual bytes on disk in the HF cache while from_pretrained downloads,
+    since it doesn't expose a progress callback of its own."""
+    blobs_dir = _hf_cache_blobs_dir(MODEL_ID)
+    while not stop_event.is_set():
+        downloaded = _dir_size_bytes(blobs_dir)
+        pct = min(99, round(downloaded / MODEL_APPROX_BYTES * 100))
+        gb = downloaded / (1024 ** 3)
+        _set_status("downloading", f"Downloading {MODEL_ID}: {gb:.1f}GB / ~18GB", pct=pct)
+        stop_event.wait(3)
 
 
 def _download_lora(civitai_key: str) -> Path:
@@ -73,10 +105,21 @@ def _download_lora(civitai_key: str) -> Path:
                 "add a Civitai API key in Settings (civitai.com -> Account -> API Keys)."
             )
         resp.raise_for_status()
+        total = int(resp.headers.get("Content-Length") or 0) or None
+        downloaded = 0
         with open(tmp, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    f.write(chunk)
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    pct = round(downloaded / total * 100)
+                    _set_status(
+                        "downloading",
+                        f"Downloading realism LoRA: {downloaded / 1e6:.0f}MB / {total / 1e6:.0f}MB",
+                        pct=pct,
+                    )
     tmp.rename(dest)
     return dest
 
@@ -87,13 +130,21 @@ def setup_enhance(hf_token: str, civitai_key: str = "") -> None:
     subsequent enhance calls."""
     global _pipe
     try:
-        _set_status("downloading", f"Downloading {MODEL_ID} (first time only, ~18GB)...")
+        _set_status("downloading", f"Downloading {MODEL_ID} (first time only, ~18GB)...", pct=0)
         from diffusers import Flux2KleinPipeline
 
-        pipe = Flux2KleinPipeline.from_pretrained(
-            MODEL_ID, torch_dtype=torch.bfloat16, token=hf_token or None,
-        )
-        _set_status("downloading", "Downloading realism LoRA (SamsungCam UltraReal, ~80MB)...")
+        stop_event = threading.Event()
+        watcher = threading.Thread(target=_watch_model_download, args=(stop_event,), daemon=True)
+        watcher.start()
+        try:
+            pipe = Flux2KleinPipeline.from_pretrained(
+                MODEL_ID, torch_dtype=torch.bfloat16, token=hf_token or None,
+            )
+        finally:
+            stop_event.set()
+            watcher.join(timeout=2)
+
+        _set_status("downloading", "Downloading realism LoRA (SamsungCam UltraReal, ~80MB)...", pct=0)
         lora_path = _download_lora(civitai_key)
         pipe.load_lora_weights(str(lora_path), adapter_name=LORA_ADAPTER_NAME)
         pipe.set_adapters([LORA_ADAPTER_NAME], adapter_weights=[DEFAULT_LORA_WEIGHT])
@@ -101,7 +152,7 @@ def setup_enhance(hf_token: str, civitai_key: str = "") -> None:
         pipe.to("cuda")
         with _pipe_lock:
             _pipe = pipe
-        _set_status("ready", "Ready.")
+        _set_status("ready", "Ready.", pct=100)
     except Exception as exc:  # noqa: BLE001 - surface any failure to the UI, this is best-effort
         msg = str(exc)
         if "gated" in msg.lower() or "403" in msg or "401" in msg:

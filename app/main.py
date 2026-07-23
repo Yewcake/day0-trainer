@@ -435,7 +435,7 @@ def _enhance_run_worker() -> None:
             if out_dir.exists():
                 shutil.rmtree(out_dir)
             candidates = enhance.run_enhance(
-                source, item["prompt"], 4, out_dir,
+                source, item["prompt"], item.get("count", 1), out_dir,
                 lora_weight=item.get("lora_weight", enhance.DEFAULT_LORA_WEIGHT),
             )
             with _enhance_queue_lock:
@@ -496,6 +496,10 @@ def enhance_queue_add(name: str, payload: dict) -> dict:
         lora_weight = float(payload.get("lora_weight", enhance.DEFAULT_LORA_WEIGHT))
     except (TypeError, ValueError):
         lora_weight = enhance.DEFAULT_LORA_WEIGHT
+    try:
+        count = max(1, min(4, int(payload.get("count", 1))))
+    except (TypeError, ValueError):
+        count = 1
     global _enhance_order_counter
     queued = []
     with _enhance_queue_lock:
@@ -506,7 +510,7 @@ def enhance_queue_add(name: str, payload: dict) -> dict:
             key = f"{name}::{image}"
             _enhance_order_counter += 1
             _enhance_queue[key] = {
-                "dataset": name, "image": image, "status": "queued",
+                "dataset": name, "image": image, "status": "queued", "count": count,
                 "candidates": [], "prompt": prompt, "lora_weight": lora_weight, "error": "",
                 "order": _enhance_order_counter,
             }

@@ -557,6 +557,7 @@ async function openDataset(name){
         <span class="hint" id="cap_stat">idle</span></div>
     </div>
     <div class="toolbar" style="margin-top:16px;margin-bottom:0"><h3 style="margin:0">Images</h3>
+      <label class="hint" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="selAll" onchange="toggleSelectAll(this)" style="width:auto">Select all</label>
       <span class="hint" id="selCount">0 selected</span>
       <div class="spacer"></div>
       <button type="button" onclick="enhanceSelected('${name}')">✦ Enhance selected</button>
@@ -566,6 +567,8 @@ async function openDataset(name){
       <textarea id="enhancePrompt" placeholder="enhancement prompt"></textarea>
       <div class="row" style="margin-bottom:8px"><label>Realism LoRA strength</label>
         <input id="enhanceLoraWeight" type="number" step="0.05" min="0" max="1.5" value="0.8" style="max-width:120px"></div>
+      <div class="row" style="margin-bottom:8px"><label>Candidates per image</label>
+        <input id="enhanceCount" type="number" min="1" max="4" value="1" style="max-width:120px"></div>
       <div id="enhanceRows"></div>
     </div>
     <div class="dsgrid" id="dsgrid"></div>`;
@@ -599,8 +602,16 @@ async function renderItems(name){
 }
 
 function updateSelCount(){
-  const n = document.querySelectorAll('#dsgrid .selchk:checked').length;
+  const boxes = [...document.querySelectorAll('#dsgrid .selchk')];
+  const n = boxes.filter(b=>b.checked).length;
   const el = $('#selCount'); if (el) el.textContent = `${n} selected`;
+  const selAll = $('#selAll');
+  if (selAll){ selAll.checked = boxes.length>0 && n===boxes.length; selAll.indeterminate = n>0 && n<boxes.length; }
+}
+
+function toggleSelectAll(checkbox){
+  document.querySelectorAll('#dsgrid .selchk').forEach(el => el.checked = checkbox.checked);
+  updateSelCount();
 }
 
 /* ---------------- image enhance (Flux.2 Klein, optional) ---------------- */
@@ -638,8 +649,9 @@ async function queueEnhanceImages(name, images){
 async function doQueueEnhance(name, images){
   const prompt = ($('#enhancePrompt')?.value || '').trim();
   const lora_weight = parseFloat($('#enhanceLoraWeight')?.value) || 0;
+  const count = parseInt($('#enhanceCount')?.value) || 1;
   try{
-    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`, {images, prompt, lora_weight});
+    await post(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`, {images, prompt, lora_weight, count});
   }catch(e){ toast(e.message); return; }
   pollEnhanceQueue(name);
 }
@@ -658,7 +670,8 @@ function showEnhanceSetupModal(name, images, status){
       repos you can access" enabled (Settings → Access Tokens). If the LoRA download fails with a 401,
       add a Civitai API key in Settings. Also uses the same GPU as training, so stop any running job first.
     </div>
-    <div id="enhanceSetupStatus" class="hint" style="display:block;margin-bottom:12px">${status.status==='failed' ? 'Failed: '+escHtml(status.error) : (status.detail || 'Not started.')}</div>
+    <div id="enhanceSetupStatus" class="hint" style="display:block;margin-bottom:8px">${status.status==='failed' ? 'Failed: '+escHtml(status.error) : (status.detail || 'Not started.')}</div>
+    <div class="progressbar" id="enhanceSetupBarWrap" style="margin-bottom:12px;${(busy && status.pct!=null)?'':'display:none'}"><div id="enhanceSetupBar" style="width:${status.pct||0}%"></div></div>
     <div class="modal-actions">
       <button type="button" id="modalCancel">Cancel</button>
       <button type="button" class="primary" id="modalOk" ${busy?'disabled':''}>${busy ? 'Setting up…' : (status.status==='failed' ? 'Retry setup' : 'Set up now')}</button>
@@ -679,6 +692,9 @@ async function pollEnhanceSetup(name, images){
     if (!el){ clearInterval(timer); return; } // modal was closed/replaced
     const s = await api('/api/enhance/status');
     el.textContent = `${s.status}${s.detail ? ': '+s.detail : ''}`;
+    const barWrap = $('#enhanceSetupBarWrap'), bar = $('#enhanceSetupBar');
+    if (bar) bar.style.width = (s.pct||0)+'%';
+    if (barWrap) barWrap.style.display = (s.status==='downloading' && s.pct!=null) ? '' : 'none';
     if (s.status === 'ready'){
       clearInterval(timer);
       $('#modalBackdrop').style.display = 'none';
@@ -717,7 +733,7 @@ function renderEnhanceRow(name, it){
     candsHtml = `<div class="enh-placeholder">Failed: ${escHtml(it.error)}</div>`;
   } else {
     const label = it.status === 'running' ? 'Generating…' : 'Queued…';
-    candsHtml = Array.from({length: 4}).map(()=>`<div class="enh-placeholder">${label}</div>`).join('');
+    candsHtml = Array.from({length: it.count || 1}).map(()=>`<div class="enh-placeholder">${label}</div>`).join('');
   }
   return `<div class="enh-row">
     <div class="enh-orig"><img src="${thumb}"><div class="hint">${escHtml(it.image)}</div></div>
