@@ -53,7 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_num_inference_steps", type=int, default=28)
     parser.add_argument("--sample_guidance_scale", type=float, default=4.0)
     parser.add_argument("--sample_lora_scale", type=float, default=1.35)
-    parser.add_argument("--sample_compare_base", type=int, default=0)
     parser.add_argument("--sample_seed", type=int, default=1234)
     parser.add_argument("--allow_weight_mismatch", type=int, default=0)
     parser.add_argument("--rank", type=int, default=16)
@@ -1248,20 +1247,6 @@ def train(args: argparse.Namespace) -> None:
             with torch.no_grad():
                 for idx, prompt in enumerate(prompts):
                     seed = args.sample_seed + step + idx
-                    if args.sample_compare_base:
-                        base_generator = torch.Generator(device=device).manual_seed(seed)
-                        base_image = sample_pipe(
-                            prompt=prompt,
-                            height=args.resolution,
-                            width=args.resolution,
-                            num_inference_steps=args.sample_num_inference_steps,
-                            guidance_scale=args.sample_guidance_scale,
-                            generator=base_generator,
-                        ).images[0]
-                        base_image.save(sample_dir / f"base_{idx + 1:02d}.png")
-                        if use_wandb:
-                            wandb.log({f"samples/base_{idx + 1:02d}": wandb.Image(base_image, caption=prompt)}, step=step)
-
                     if idx == 0:
                         if args.network_type == "lokr":
                             from peft import inject_adapter_in_model
