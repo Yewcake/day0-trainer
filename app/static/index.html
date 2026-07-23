@@ -333,6 +333,16 @@ async function onDatasetChange(){
     const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
     $('#f_valimage').innerHTML = '<option value="">None (skip validation)</option>' +
       items.map(it=>`<option value="${escHtml(it.image)}">${escHtml(it.image)}</option>`).join('');
+    // Auto hold out a random image as the validation signal by default -- captioned ones
+    // preferred so the prompt auto-fill below isn't blank. Still overridable/skippable
+    // via the dropdown. This is a true holdout (excluded from training), not a duplicate --
+    // duplicating it would mean training on it too, which defeats the point: validation
+    // only means anything if the model never saw that exact image during training.
+    if (items.length){
+      const captioned = items.filter(it => it.caption);
+      const pool = captioned.length ? captioned : items;
+      $('#f_valimage').value = pool[Math.floor(Math.random() * pool.length)].image;
+    }
   }catch(e){}
   onValidationImageChange();
   applyTriggerToPrompts();
@@ -903,7 +913,7 @@ async function openJob(id){
       <button class="danger" onclick="stopJob('${id}')">Stop</button>
       <button class="danger" onclick="deleteJob('${id}')">Delete</button></div>
     <div class="card chartwrap"><canvas id="chart" height="250"></canvas>
-      <div class="chart-legend">loss · <b>ema</b><span id="chart-legend-val" style="display:none"> · <b style="color:var(--err)">val loss</b></span></div>
+      <div class="chart-legend">loss · <b>ema</b> · <span style="opacity:.6">min/max band</span><span id="chart-legend-val" style="display:none"> · <b style="color:var(--err)">val loss</b></span></div>
       <div class="statline" id="statline"></div></div>
     <div id="analysis"></div>
     <h3>Samples</h3><div class="samples" id="samples"><div class="empty">No samples yet.</div></div>
@@ -944,6 +954,20 @@ async function deleteJob(id){
 
 function ema(values, alpha=0.06){ const out=[]; let prev=values[0]; for(const v of values){ prev=alpha*v+(1-alpha)*prev; out.push(prev);} return out; }
 
+// Rolling min/max over a recent window of raw (noisy) loss values -- lets the chart show
+// spike amplitude shrinking over a run, which is the visible signature of a cosine schedule
+// actually converging (vs. a flat/non-shrinking band, which flags LR not decaying enough).
+function rollingMinMax(values, window){
+  const mins = [], maxs = [];
+  for (let i=0;i<values.length;i++){
+    const start = Math.max(0, i-window+1);
+    let mn=Infinity, mx=-Infinity;
+    for (let j=start;j<=i;j++){ if(values[j]<mn) mn=values[j]; if(values[j]>mx) mx=values[j]; }
+    mins.push(mn); maxs.push(mx);
+  }
+  return {mins, maxs};
+}
+
 async function drawMetrics(id){
   const data = await api(`/api/jobs/${id}/metrics`);
   const st = $('#jobstatus'); if(st){ st.textContent=data.status; st.className='st '+data.status; }
@@ -969,6 +993,15 @@ async function drawMetrics(id){
     ctx.fillText((hi-(hi-lo)*g/4).toFixed(3), 4, gy+3);
   }
   ctx.fillText(String(steps[0]), pad.l, H-6); ctx.fillText(String(steps.at(-1)), W-pad.r-36, H-6);
+  if (loss.length > 1){
+    const envWindow = 15;
+    const {mins: envMin, maxs: envMax} = rollingMinMax(loss, envWindow);
+    ctx.beginPath();
+    envMax.forEach((v,i)=> i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v)));
+    for (let i=envMin.length-1;i>=0;i--){ ctx.lineTo(x(i), y(envMin[i])); }
+    ctx.closePath();
+    ctx.fillStyle = css('--accent'); ctx.globalAlpha = 0.12; ctx.fill(); ctx.globalAlpha = 1;
+  }
   ctx.strokeStyle = css('--muted'); ctx.globalAlpha = 0.35; ctx.beginPath();
   loss.forEach((v,i)=> i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v))); ctx.stroke(); ctx.globalAlpha = 1;
   ctx.lineWidth=2; ctx.strokeStyle = css('--accent'); ctx.beginPath();
