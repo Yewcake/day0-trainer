@@ -102,6 +102,14 @@
   .progressbar>div{height:100%;background:var(--accent);width:0%}
   .lightbox{position:fixed;inset:0;background:rgba(8,7,12,.92);display:none;align-items:center;justify-content:center;z-index:10;cursor:zoom-out}
   .lightbox img{max-width:92vw;max-height:92vh;border-radius:8px}
+  .lb-compare{display:flex;flex-direction:column;align-items:center;gap:12px;cursor:default}
+  .lb-wrap{position:relative;display:inline-block;max-width:92vw;max-height:80vh}
+  .lb-wrap img{display:block;max-width:92vw;max-height:80vh;border-radius:8px;object-fit:contain}
+  .lb-after{position:absolute;inset:0;width:100%;height:100%;clip-path:inset(0 50% 0 0)}
+  .lb-label{position:absolute;top:10px;background:rgba(8,7,12,.7);color:#fff;padding:3px 10px;border-radius:6px;font-size:12px;font-family:var(--mono);pointer-events:none}
+  .lb-label-l{left:10px}
+  .lb-label-r{right:10px}
+  .lb-range{width:min(92vw,420px);cursor:pointer}
   .toast{position:fixed;bottom:18px;right:18px;background:var(--panel-2);border:1px solid var(--accent);padding:10px 14px;border-radius:8px;font-family:var(--mono);font-size:12px;display:none;z-index:20}
   .empty{color:var(--muted);font-size:13px;padding:8px 0}
   .hint{color:var(--muted);font-size:12px}
@@ -130,7 +138,18 @@
   </aside>
   <main class="main" id="main"></main>
 </div>
-<div class="lightbox" id="lightbox" onclick="this.style.display='none'"><img id="lightimg" alt=""></div>
+<div class="lightbox" id="lightbox" onclick="if(event.target===this) closeLightbox()">
+  <img id="lightimg" alt="" onclick="closeLightbox()">
+  <div id="lbCompare" class="lb-compare" style="display:none">
+    <div class="lb-wrap">
+      <img id="lbBefore" class="lb-before" alt="Original">
+      <img id="lbAfter" class="lb-after" alt="Refined">
+      <div class="lb-label lb-label-l">Original</div>
+      <div class="lb-label lb-label-r">Refined</div>
+    </div>
+    <input type="range" id="lbRange" class="lb-range" min="0" max="100" value="50" oninput="lbSlide(this.value)">
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 <div class="modal-backdrop" id="modalBackdrop"><div class="modal-box" id="modalBox"></div></div>
 
@@ -604,6 +623,7 @@ async function openDataset(name){
           <option value="1.5">1.5 MP</option>
           <option value="2">2 MP (upscale, slower)</option>
         </select></div>
+      <div id="enhanceStaging"></div>
       <div id="enhanceRows"></div>
     </div>
     <div class="dsgrid" id="dsgrid"></div>`;
@@ -669,6 +689,7 @@ function toggleSelectAll(checkbox){
 /* ---------------- image enhance (Flux.2 Klein, optional) ---------------- */
 async function initEnhancePanel(name){
   clearInterval(enhanceTimer);
+  _enhancePending = [];
   const box = $('#enhancePrompt'), weightBox = $('#enhanceLoraWeight');
   if (box && !box.value){
     try{
@@ -681,20 +702,50 @@ async function initEnhancePanel(name){
   enhanceTimer = setInterval(()=>pollEnhanceQueue(name), 2500);
 }
 
+let _enhancePending = []; // staged image filenames, waiting on the user to hit Generate
+
 async function openEnhance(name, image){
-  await queueEnhanceImages(name, [image]);
+  await stageForEnhance(name, [image]);
 }
 
 async function enhanceSelected(name){
   const images = [...document.querySelectorAll('#dsgrid .selchk:checked')].map(el=>el.dataset.image);
   if (!images.length){ toast('Select at least one image first.'); return; }
-  await queueEnhanceImages(name, images);
+  await stageForEnhance(name, images);
 }
 
-async function queueEnhanceImages(name, images){
+async function stageForEnhance(name, images){
   let status;
   try{ status = await api('/api/enhance/status'); }catch(e){ toast(e.message); return; }
   if (status.status !== 'ready'){ showEnhanceSetupModal(name, images, status); return; }
+  _enhancePending = images;
+  renderEnhanceStaging(name);
+  const panel = $('#enhancePanel');
+  if (panel){ panel.style.display = 'block'; panel.scrollIntoView({behavior:'smooth', block:'nearest'}); }
+}
+
+function renderEnhanceStaging(name){
+  const el = $('#enhanceStaging');
+  if (!el) return;
+  if (!_enhancePending.length){ el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="hint" style="margin-bottom:8px;display:block">
+      Ready to generate for: ${_enhancePending.map(escHtml).join(', ')} — adjust the settings above, then:
+    </div>
+    <div class="modal-actions" style="justify-content:flex-start;margin:0 0 14px">
+      <button type="button" class="primary" onclick="confirmEnhanceGenerate('${name}')">Generate</button>
+      <button type="button" onclick="cancelEnhanceStaging()">Cancel</button>
+    </div>`;
+}
+
+function cancelEnhanceStaging(){
+  _enhancePending = [];
+  renderEnhanceStaging();
+}
+
+async function confirmEnhanceGenerate(name){
+  const images = _enhancePending;
+  _enhancePending = [];
+  renderEnhanceStaging(name);
   await doQueueEnhance(name, images);
 }
 
@@ -751,7 +802,10 @@ async function pollEnhanceSetup(name, images){
     if (s.status === 'ready'){
       clearInterval(timer);
       $('#modalBackdrop').style.display = 'none';
-      await doQueueEnhance(name, images);
+      _enhancePending = images;
+      renderEnhanceStaging(name);
+      const panel = $('#enhancePanel');
+      if (panel){ panel.style.display = 'block'; panel.scrollIntoView({behavior:'smooth', block:'nearest'}); }
     } else if (s.status === 'failed'){
       clearInterval(timer);
       el.textContent = 'Failed: ' + s.error;
@@ -768,7 +822,7 @@ async function pollEnhanceQueue(name){
   let items;
   try{ items = (await api(`/api/datasets/${encodeURIComponent(name)}/enhance/queue`)).items; }
   catch(e){ return; }
-  panel.style.display = items.length ? 'block' : 'none';
+  panel.style.display = (items.length || _enhancePending.length) ? 'block' : 'none';
   rows.innerHTML = items.map(it => renderEnhanceRow(name, it)).join('');
 }
 
@@ -780,6 +834,7 @@ function renderEnhanceRow(name, it){
   const thumb = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
   const dsItem = _dsItemsCache.find(d => d.image === it.image);
   const origDims = dsItem ? dimsLabel(dsItem.width, dsItem.height) : '';
+  const bigOrig = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}&size=1600`;
   let candsHtml;
   if (it.status === 'done'){
     candsHtml = it.candidates.map(c=>{
@@ -787,7 +842,7 @@ function renderEnhanceRow(name, it){
       return `<div class="enh-cand">
         <div class="ba-wrap">
           <img class="ba-before" src="${thumb}">
-          <img class="ba-after" src="${src}" onclick="lightbox('${src}')"
+          <img class="ba-after" src="${src}" onclick="lightboxCompare('${bigOrig}','${src}')"
             onload="this.closest('.enh-cand').querySelector('.enh-cand-dims').textContent=dimsLabel(this.naturalWidth,this.naturalHeight)">
         </div>
         <input type="range" class="ba-range" min="0" max="100" value="50" oninput="baSlide(this)">
@@ -993,9 +1048,16 @@ async function drawMetrics(id){
   // image/noise/seed every time), unlike the noisy per-step training loss -- the cleaner signal.
   const valPoints = pts.map((p,i)=>({i, v:p.val_loss})).filter(p=>p.v!=null && !isNaN(p.v));
   const pad = {l:46,r:10,t:12,b:22};
-  const rangeSource = loss.concat(valPoints.map(p=>p.v));
-  const sorted = [...rangeSource].sort((a,b)=>a-b);
-  const lo = sorted[0], hi = sorted[Math.floor(sorted.length*0.98)] ?? sorted.at(-1);
+  // Scale the y-axis to the EMA trend (+ val_loss), not raw per-step loss -- raw loss spikes
+  // (single-image batches, random timesteps) used to stretch the axis so far that the actual
+  // decline got compressed into a sliver near the bottom. Raw loss/envelope still draw at full
+  // amplitude and simply clip at the edges when they spike past this range, which is correct:
+  // the EMA line is the trend that should fill the chart.
+  const trendSource = smooth.concat(valPoints.map(p=>p.v));
+  let lo = Math.min(...trendSource), hi = Math.max(...trendSource);
+  const span = (hi - lo) || (hi * 0.1) || 1;
+  lo = Math.max(0, lo - span * 0.08);
+  hi = hi + span * 0.08;
   const x = i => pad.l + (W-pad.l-pad.r)*(i/(pts.length-1||1));
   const y = v => pad.t + (H-pad.t-pad.b)*(1-Math.min(1,Math.max(0,(v-lo)/((hi-lo)||1))));
   const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -1063,7 +1125,28 @@ async function loadSamples(id){
       }).join('')}</div></div>`).join('');
 }
 
-function lightbox(src){ $('#lightimg').src = src; $('#lightbox').style.display='flex'; }
+function closeLightbox(){ $('#lightbox').style.display = 'none'; }
+
+function lightbox(src){
+  $('#lbCompare').style.display = 'none';
+  const img = $('#lightimg'); img.style.display = 'block'; img.src = src;
+  $('#lightbox').style.display = 'flex';
+}
+
+function lightboxCompare(beforeSrc, afterSrc){
+  $('#lightimg').style.display = 'none';
+  $('#lbBefore').src = beforeSrc;
+  $('#lbAfter').src = afterSrc;
+  $('#lbRange').value = 50;
+  lbSlide(50);
+  $('#lbCompare').style.display = 'flex';
+  $('#lightbox').style.display = 'flex';
+}
+
+function lbSlide(val){
+  const after = $('#lbAfter');
+  if (after) after.style.clipPath = `inset(0 ${100-val}% 0 0)`;
+}
 
 async function loadCheckpoints(id){
   const cps = await api(`/api/jobs/${id}/checkpoints`);
