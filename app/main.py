@@ -777,6 +777,7 @@ def create_job(payload: dict) -> dict:
         "gradient_checkpointing": 1, "transformer_group_offload": 0, "group_offload_blocks": 1,
         "weight_decay": 0.01, "lokr_decompose_both": 0,
         "validation_image": "", "validation_prompt": "", "auto_analyze": False,
+        "masterchef_enabled": False,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -822,6 +823,7 @@ def create_job(payload: dict) -> dict:
         "--validation_prompt", str(config["validation_prompt"]),
         "--seed", str(config["seed"]),
         "--enable_wandb", "0",
+        "--masterchef_enabled", "1" if config["masterchef_enabled"] else "0",
     ]
 
     env = os.environ.copy()
@@ -888,10 +890,13 @@ def job_metrics(job_id: str, max_points: int = 1200) -> dict:
     status = job_status(job_id)
     config_file = directory / "config.json"
     total_steps = None
+    dataset_name = None
     started_at = None
     if config_file.exists():
         try:
-            total_steps = json.loads(config_file.read_text()).get("steps")
+            job_config = json.loads(config_file.read_text())
+            total_steps = job_config.get("steps")
+            dataset_name = job_config.get("dataset")
         except Exception:
             pass
         started_at = config_file.stat().st_mtime
@@ -906,7 +911,19 @@ def job_metrics(job_id: str, max_points: int = 1200) -> dict:
     return {
         "status": status, "points": points,
         "total_steps": total_steps, "elapsed_seconds": elapsed_seconds,
+        "dataset": dataset_name,
     }
+
+
+@app.get("/api/jobs/{job_id}/masterchef", dependencies=[Depends(require_auth)])
+def job_masterchef(job_id: str) -> dict:
+    status_file = job_dir(job_id) / "run" / "masterchef_status.json"
+    if not status_file.exists():
+        return {"enabled": False, "images": []}
+    try:
+        return json.loads(status_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {"enabled": False, "images": []}
 
 
 @app.get("/api/jobs/{job_id}/log", dependencies=[Depends(require_auth)])

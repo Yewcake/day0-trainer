@@ -42,6 +42,11 @@
   .st{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:1px}
   .st.running{color:var(--accent)} .st.finished{color:var(--text)}
   .st.failed,.st.stopped{color:var(--err)} .st.unknown,.st.idle{color:var(--muted)}
+  .st.suspect{color:goldenrod} .st.stuck{color:var(--err)} .st.excluded{color:var(--muted);text-decoration:line-through}
+  .mc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px}
+  .mc-item{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer}
+  .mc-item img{width:100%;height:110px;object-fit:cover;display:block}
+  .mc-item .mc-meta{padding:6px 8px}
   .main{padding:24px 28px;max-width:1150px}
   h2{font-family:var(--mono);font-weight:600;font-size:16px;margin-bottom:14px}
   h3{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:22px 0 10px;font-weight:600}
@@ -301,6 +306,9 @@ async function showTrain(){
     <div class="row"><label>Auto-analyze</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_autoanalyze" style="width:auto" checked>Automatically analyze with Gemini when training finishes</label>
     </div>
+    <div class="row"><label>Masterchef</label>
+      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_masterchef" style="width:auto">🧪 Masterchef Cooking (experimental) — detect and throttle problem images while training</label>
+    </div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
     <div style="margin-top:14px"><button class="primary" type="submit">Start training</button></div>
@@ -458,6 +466,7 @@ async function submitJob(ev){
     gradient_checkpointing:+$('#f_gc').value,
     validation_image: $('#f_valimage').value, validation_prompt: $('#f_valprompt').value.trim(),
     auto_analyze: $('#f_autoanalyze').checked,
+    masterchef_enabled: $('#f_masterchef').checked,
     sample_prompts: prompts,
   };
   try{ const job = await post('/api/jobs', payload); toast('Training started.'); openJob(job.id); }
@@ -986,6 +995,7 @@ async function openJob(id){
     <div id="analysis"></div>
     <h3>Samples</h3><div class="samples" id="samples"><div class="empty">No samples yet.</div></div>
     <h3>Checkpoints</h3><div id="checkpoints"><div class="empty">No checkpoints yet.</div></div>
+    <h3>🧪 Masterchef Cooking (experimental)</h3><div id="masterchef"><div class="empty">Not enabled for this run.</div></div>
     <h3>Log</h3><pre class="log" id="log"></pre>`;
   let analysisShown = false;
   const checkAnalysis = async () => {
@@ -999,7 +1009,7 @@ async function openJob(id){
   await checkAnalysis();
   // Auto-analyze runs in the background after training finishes, so keep polling
   // for it to appear (e.g. "analyze on completion" was checked) until it shows up.
-  const poll = () => { drawMetrics(id); loadSamples(id); loadCheckpoints(id); loadLog(id); checkAnalysis(); };
+  const poll = () => { drawMetrics(id); loadSamples(id); loadCheckpoints(id); loadMasterchef(id); loadLog(id); checkAnalysis(); };
   poll(); pollTimer = setInterval(poll, 4000);
 }
 
@@ -1156,6 +1166,28 @@ async function loadCheckpoints(id){
     ${cps.map(c=>`<tr><td>${c.step}</td><td>${c.size_mb} MB</td>
       <td><a href="/api/jobs/${id}/checkpoints/${c.step}/download?t=${encodeURIComponent(TOKEN)}">download</a></td></tr>`).join('')}
   </table></div>`;
+}
+
+async function loadMasterchef(id){
+  const el = $('#masterchef');
+  if (!el) return;
+  const data = await api(`/api/jobs/${id}/masterchef`);
+  if (!data.enabled){ el.innerHTML = '<div class="empty">Not enabled for this run.</div>'; return; }
+  if (!data.images?.length){ el.innerHTML = '<div class="empty">Enabled — no problem images flagged yet.</div>'; return; }
+  const meta = await api(`/api/jobs/${id}/metrics`);
+  const dsName = meta.dataset;
+  el.innerHTML = `<div class="mc-grid">${data.images.map(img => {
+    const src = dsName ? `/api/datasets/${encodeURIComponent(dsName)}/thumb/${encodeURIComponent(img.image)}?t=${encodeURIComponent(TOKEN)}` : '';
+    return `<div class="mc-item" ${dsName ? `onclick="openDataset('${dsName}')"` : ''}>
+      ${src ? `<img loading="lazy" src="${src}">` : ''}
+      <div class="mc-meta">
+        <div class="hint">${escHtml(img.image)}</div>
+        <span class="st ${img.status}">${img.status}</span>
+        <div class="hint">ratio ${img.ratio_ema.toFixed(2)}×</div>
+      </div>
+    </div>`;
+  }).join('')}</div>
+  <div class="hint" style="margin-top:8px;display:block">Suspect/stuck images have their gradient contribution throttled automatically. Excluded images are skipped entirely — fix the caption on the Datasets page and they're picked back up on a future run.</div>`;
 }
 
 async function loadLog(id){

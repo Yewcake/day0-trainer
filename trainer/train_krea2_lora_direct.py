@@ -29,6 +29,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 from automagic import Automagic
+from masterchef import MasterchefTracker
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -89,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation_prompt", default="")  # falls back to the image's own caption if empty
     parser.add_argument("--gradient_checkpointing", type=int, default=0)
     parser.add_argument("--enable_wandb", type=int, default=0)
+    parser.add_argument("--masterchef_enabled", type=int, default=0)
     parser.add_argument("--wandb_project", default="krea2-lora")
     parser.add_argument("--fp8_base", type=int, default=0)
     parser.add_argument("--train_dtype", default="bf16", choices=["bf16", "fp32"])
@@ -190,6 +192,11 @@ class CachedKreaDataset(Dataset):
     def __len__(self) -> int:
         return len(self.latents)
 
+    def image_name(self, idx: int) -> str:
+        if self.rows and idx < len(self.rows) and "image" in self.rows[idx]:
+            return self.rows[idx]["image"]
+        return self.latents[idx].stem
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         from safetensors.torch import load_file
 
@@ -199,6 +206,7 @@ class CachedKreaDataset(Dataset):
             "latents": latent,
             "prompt_embeds": embed_pack["prompt_embeds"],
             "prompt_attention_mask": embed_pack["prompt_attention_mask"],
+            "row_idx": idx,
         }
 
 
@@ -522,6 +530,7 @@ def collate_cached(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
         "latents": torch.cat([item["latents"] for item in batch], dim=0),
         "prompt_embeds": torch.cat([item["prompt_embeds"] for item in batch], dim=0),
         "prompt_attention_mask": torch.cat([item["prompt_attention_mask"] for item in batch], dim=0),
+        "row_idx": [item["row_idx"] for item in batch],
     }
 
 
@@ -1196,6 +1205,11 @@ def train(args: argparse.Namespace) -> None:
     )
 
     dataset = CachedKreaDataset(cache_dir)
+    masterchef_enabled = bool(args.masterchef_enabled)
+    masterchef = MasterchefTracker() if masterchef_enabled else None
+    if masterchef_enabled and args.train_batch_size != 1:
+        print("Masterchef Cooking requires train_batch_size=1 (each step = one image); disabling.")
+        masterchef_enabled = False
     if int(args.enable_buckets) and args.train_batch_size > 1:
         batch_sampler = BucketBatchSampler(dataset.bucket_keys, args.train_batch_size, drop_last=False, shuffle=True)
         loader = DataLoader(
@@ -1365,6 +1379,10 @@ def train(args: argparse.Namespace) -> None:
     while global_step < args.max_train_steps:
         epoch += 1
         for batch in loader:
+            image_name = dataset.image_name(batch["row_idx"][0]) if masterchef_enabled else None
+            if masterchef_enabled and masterchef.is_excluded(image_name):
+                continue
+
             latents = batch["latents"].to(device=device, dtype=train_dtype)
             prompt_embeds = batch["prompt_embeds"].to(device=device, dtype=train_dtype)
             prompt_attention_mask = batch["prompt_attention_mask"].to(device=device)
@@ -1399,7 +1417,15 @@ def train(args: argparse.Namespace) -> None:
             )[0]
 
             loss = F.mse_loss(pred.float(), target_packed.float(), reduction="mean")
+            if masterchef_enabled:
+                masterchef.observe(image_name, loss.item(), t.item(), epoch)
             loss.backward()
+            if masterchef_enabled:
+                multiplier = masterchef.multiplier_for(image_name)
+                if multiplier != 1.0:
+                    for p in trainable:
+                        if p.grad is not None:
+                            p.grad.mul_(multiplier)
             stats_before_step = trainable_stats(transformer)
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
@@ -1447,6 +1473,15 @@ def train(args: argparse.Namespace) -> None:
 
             if global_step >= args.max_train_steps:
                 break
+
+        if masterchef_enabled:
+            masterchef.sweep_epoch(epoch)
+            try:
+                (run_dir / "masterchef_status.json").write_text(
+                    json.dumps(masterchef.to_status_dict()), encoding="utf-8"
+                )
+            except Exception as exc:
+                print(f"Masterchef status write failed at epoch {epoch}: {exc}")
 
         if (
             args.save_every_n_epochs > 0
