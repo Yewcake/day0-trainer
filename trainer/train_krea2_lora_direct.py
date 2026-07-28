@@ -536,6 +536,11 @@ def collate_cached(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
 
 VALIDATION_SIGMAS = (1.0, 0.75, 0.5, 0.25)
 
+# 3:4 portrait at ~1MP, both divisible by 64 -- matches the "3:4 Portrait Standard"
+# preset in the reference ComfyUI workflow rather than a square training-resolution crop.
+SAMPLE_WIDTH = 896
+SAMPLE_HEIGHT = 1152
+
 
 def compute_validation_loss(
     transformer,
@@ -1296,8 +1301,13 @@ def train(args: argparse.Namespace) -> None:
                     lora_generator = torch.Generator(device=device).manual_seed(seed)
                     image = sample_pipe(
                         prompt=prompt,
-                        height=args.resolution,
-                        width=args.resolution,
+                        # Portrait, not the square training resolution -- these are candid
+                        # phone-photo-style prompts, and square framing doesn't match that
+                        # (or the reference ComfyUI workflow's own "3:4 Portrait" preset).
+                        # Independent of training resolution on purpose: this is just how
+                        # the preview renders, not what the LoRA trains on.
+                        height=SAMPLE_HEIGHT,
+                        width=SAMPLE_WIDTH,
                         num_inference_steps=args.sample_num_inference_steps,
                         guidance_scale=args.sample_guidance_scale,
                         generator=lora_generator,
