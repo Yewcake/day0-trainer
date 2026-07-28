@@ -771,8 +771,8 @@ def create_job(payload: dict) -> dict:
 
     defaults = {
         "model_path": model_entry["default_path"], "resolution": 1024, "steps": 2000,
-        "save_every": 250, "sample_every": 500, "sample_steps": 8, "batch_size": 1,
-        "sample_inference_model": "krea/Krea-2-Turbo", "sample_guidance_scale": 0.0,
+        "save_every": 250, "sample_every": 500, "sample_steps": 12, "batch_size": 1,
+        "sample_inference_model": "", "sample_guidance_scale": 4.0,
         "rank": 32, "lokr_factor": -1, "lokr_full_rank": 0, "learning_rate": "1e-4",
         "target_modules": "identity", "optimizer": "paged_adamw8bit",
         "gradient_checkpointing": 1, "transformer_group_offload": 0, "group_offload_blocks": 1,
@@ -806,11 +806,7 @@ def create_job(payload: dict) -> dict:
         "--sample_num_inference_steps", str(config["sample_steps"]),
         "--sample_inference_model", str(config["sample_inference_model"]),
         "--sample_guidance_scale", str(config["sample_guidance_scale"]),
-        # Sampling now runs against Krea-2-Turbo instead of the model being trained --
-        # a Raw-trained LoRA applied to Turbo needs a much lighter weight than sampling
-        # against Raw itself did (community-known sweet spot, matches what a reference
-        # ComfyUI workflow using this same cross-checkpoint trick uses in production).
-        "--sample_lora_scale", "0.6" if network == "lokr" else "0.8",
+        "--sample_lora_scale", "1.0" if network == "lokr" else "1.35",
         "--sample_prompts", "||".join(prompts),
         "--network_type", network,
         "--rank", str(rank), "--lora_alpha", str(rank),
