@@ -1206,7 +1206,7 @@ def train(args: argparse.Namespace) -> None:
 
     dataset = CachedKreaDataset(cache_dir)
     masterchef_enabled = bool(args.masterchef_enabled)
-    masterchef = MasterchefTracker() if masterchef_enabled else None
+    masterchef = MasterchefTracker(len(dataset), args.max_train_steps) if masterchef_enabled else None
     if masterchef_enabled and args.train_batch_size != 1:
         print("Masterchef Cooking requires train_batch_size=1 (each step = one image); disabling.")
         masterchef_enabled = False

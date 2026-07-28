@@ -19,35 +19,56 @@ safe to bolt onto any optimizer.
 
 No auto-recaption here (v1): flagged images are surfaced for the user to fix
 by hand via the existing caption editor, not rewritten automatically.
+
+Bucket count and escalation thresholds scale with the dataset (see
+MasterchefTracker.__init__): a small dataset spreads noise-level observations
+across the same fixed bucket count far more thinly (each bucket's "what's
+normal here" baseline is built from fewer, noisier samples per epoch), and
+cycles through many more epochs for the same step budget -- fixed thresholds
+tuned against a larger dataset would flag small ones far more aggressively
+than intended, which is exactly what was observed on a 22-image run.
 """
 
 from __future__ import annotations
 
-SIGMA_BUCKETS = 8
 SIGMA_MIN = 0.02
 SIGMA_MAX = 0.98
 BUCKET_EMA_ALPHA = 0.05  # slow-moving -- this is the "what's normal here" baseline
 IMAGE_EMA_BETA = 0.15  # each image is only seen once per epoch, so a few epochs' worth of smoothing
 
 SUSPECT_RATIO = 1.3
-SUSPECT_MIN_EPOCHS = 3
-STUCK_MIN_EPOCHS = 6  # total epochs elevated (not additional) before suspect -> stuck
-EXCLUDE_MIN_EPOCHS = 10  # total epochs elevated before stuck -> excluded
 IMPROVING_DROP = 0.05  # relative drop since status started that counts as "improving"
 
 THROTTLE_MULTIPLIER = {"ok": 1.0, "suspect": 0.7, "stuck": 0.4, "excluded": 0.0}
 
 
-def _bucket_for_sigma(sigma: float) -> int:
-    span = SIGMA_MAX - SIGMA_MIN
-    frac = (min(max(sigma, SIGMA_MIN), SIGMA_MAX) - SIGMA_MIN) / span
-    return min(SIGMA_BUCKETS - 1, int(frac * SIGMA_BUCKETS))
-
-
 class MasterchefTracker:
-    def __init__(self) -> None:
-        self.bucket_ema: list[float | None] = [None] * SIGMA_BUCKETS
+    def __init__(self, dataset_size: int, max_train_steps: int) -> None:
+        # Aim for each noise-level bucket to see at least ~4 samples per epoch so its
+        # baseline isn't built from a handful of noisy draws -- small datasets get
+        # fewer, coarser buckets instead of the same 8 a large dataset can support.
+        self.sigma_buckets = max(2, min(8, dataset_size // 4))
+        self.bucket_ema: list[float | None] = [None] * self.sigma_buckets
         self.per_image: dict[str, dict] = {}
+
+        # Escalation thresholds scale with how long this run actually is (in epochs),
+        # not a fixed epoch count -- a small dataset epochs through its images many
+        # more times for the same step budget, so a fixed threshold would reach
+        # exclusion using proportionally far fewer real looks at that image.
+        total_epochs_estimate = max(1.0, max_train_steps / max(1, dataset_size))
+        self.suspect_min_epochs = max(3, round(total_epochs_estimate * 0.03))
+        self.stuck_min_epochs = max(self.suspect_min_epochs + 2, round(total_epochs_estimate * 0.08))
+        self.exclude_min_epochs = max(self.stuck_min_epochs + 3, round(total_epochs_estimate * 0.18))
+        print(
+            f"Masterchef Cooking: {self.sigma_buckets} noise-level buckets; "
+            f"escalation at {self.suspect_min_epochs}/{self.stuck_min_epochs}/{self.exclude_min_epochs} "
+            f"elevated epochs (suspect/stuck/excluded) for an estimated {total_epochs_estimate:.0f}-epoch run."
+        )
+
+    def _bucket_for_sigma(self, sigma: float) -> int:
+        span = SIGMA_MAX - SIGMA_MIN
+        frac = (min(max(sigma, SIGMA_MIN), SIGMA_MAX) - SIGMA_MIN) / span
+        return min(self.sigma_buckets - 1, int(frac * self.sigma_buckets))
 
     def _image_state(self, image: str) -> dict:
         state = self.per_image.get(image)
@@ -63,7 +84,7 @@ class MasterchefTracker:
         return state
 
     def observe(self, image: str, loss: float, sigma: float, epoch: int) -> None:
-        bucket = _bucket_for_sigma(sigma)
+        bucket = self._bucket_for_sigma(sigma)
         baseline = self.bucket_ema[bucket]
         if baseline is None:
             self.bucket_ema[bucket] = loss
@@ -102,11 +123,11 @@ class MasterchefTracker:
 
             state["epochs_in_status"] += 1
             total_elevated = state["epochs_in_status"]
-            if state["status"] == "ok" and total_elevated >= SUSPECT_MIN_EPOCHS:
+            if state["status"] == "ok" and total_elevated >= self.suspect_min_epochs:
                 state["status"] = "suspect"
-            elif state["status"] == "suspect" and total_elevated >= STUCK_MIN_EPOCHS:
+            elif state["status"] == "suspect" and total_elevated >= self.stuck_min_epochs:
                 state["status"] = "stuck"
-            elif state["status"] == "stuck" and total_elevated >= EXCLUDE_MIN_EPOCHS:
+            elif state["status"] == "stuck" and total_elevated >= self.exclude_min_epochs:
                 state["status"] = "excluded"
 
     def multiplier_for(self, image: str) -> float:
