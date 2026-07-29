@@ -36,7 +36,7 @@ SIGMA_MAX = 0.98
 BUCKET_EMA_ALPHA = 0.05  # slow-moving -- this is the "what's normal here" baseline
 IMAGE_EMA_BETA = 0.15  # each image is only seen once per epoch, so a few epochs' worth of smoothing
 
-SUSPECT_RATIO = 1.3
+SUSPECT_RATIO = 1.35
 IMPROVING_DROP = 0.05  # relative drop since status started that counts as "improving"
 
 THROTTLE_MULTIPLIER = {"ok": 1.0, "suspect": 0.7, "stuck": 0.4, "excluded": 0.0}
@@ -55,10 +55,18 @@ class MasterchefTracker:
         # not a fixed epoch count -- a small dataset epochs through its images many
         # more times for the same step budget, so a fixed threshold would reach
         # exclusion using proportionally far fewer real looks at that image.
+        #
+        # Exclusion specifically gets a much higher bar than suspect/stuck: a real
+        # run showed a well-captioned, genuinely complex/unique shot (detailed scenery,
+        # an uncommon pose, a held prop) get fully excluded after ~14 elevated epochs --
+        # that's legitimately-harder content, not a caption problem, and losing a shot
+        # like that from a diverse dataset is a worse outcome than just throttling it
+        # for longer. Suspect/stuck stay reversible and cheap either way, so only the
+        # irreversible-for-this-run outcome (excluded) needed the bar raised.
         total_epochs_estimate = max(1.0, max_train_steps / max(1, dataset_size))
-        self.suspect_min_epochs = max(3, round(total_epochs_estimate * 0.03))
-        self.stuck_min_epochs = max(self.suspect_min_epochs + 2, round(total_epochs_estimate * 0.08))
-        self.exclude_min_epochs = max(self.stuck_min_epochs + 3, round(total_epochs_estimate * 0.18))
+        self.suspect_min_epochs = max(3, round(total_epochs_estimate * 0.04))
+        self.stuck_min_epochs = max(self.suspect_min_epochs + 3, round(total_epochs_estimate * 0.10))
+        self.exclude_min_epochs = max(self.stuck_min_epochs + 10, round(total_epochs_estimate * 0.35))
         print(
             f"Masterchef Cooking: {self.sigma_buckets} noise-level buckets; "
             f"escalation at {self.suspect_min_epochs}/{self.stuck_min_epochs}/{self.exclude_min_epochs} "
