@@ -653,7 +653,10 @@ DEFAULT_CAPTION_INSTRUCTION = (
     "Caption the image for dataset creation. Mention only: expression, outfit, pose, "
     "hairstyle, camera angle, whether there is blur in the photo, jewelry, accessories, "
     "setting, background. Do not mention face shape or body type. Caption in concise "
-    "but detailed natural language. Output only the caption, no preamble."
+    "but detailed natural language. Output only the caption, no preamble. If a tattoo is "
+    "visible, caption it. Caption only what you see, in natural positive phrasing only -- "
+    "do not use words like 'no', 'or', 'not'. For example, 'face out of frame' is allowed, "
+    "but 'no visible jewelry' is not allowed -- just don't mention things that aren't there."
 )
 
 

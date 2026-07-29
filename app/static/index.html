@@ -371,18 +371,9 @@ async function onDatasetChange(){
   }
   try{
     const items = await api(`/api/datasets/${encodeURIComponent(name)}/items`);
+    // Defaults to "None" -- validation is opt-in via the dropdown, not auto-picked.
     $('#f_valimage').innerHTML = '<option value="">None (skip validation)</option>' +
       items.map(it=>`<option value="${escHtml(it.image)}">${escHtml(it.image)}</option>`).join('');
-    // Auto hold out a random image as the validation signal by default -- captioned ones
-    // preferred so the prompt auto-fill below isn't blank. Still overridable/skippable
-    // via the dropdown. This is a true holdout (excluded from training), not a duplicate --
-    // duplicating it would mean training on it too, which defeats the point: validation
-    // only means anything if the model never saw that exact image during training.
-    if (items.length){
-      const captioned = items.filter(it => it.caption);
-      const pool = captioned.length ? captioned : items;
-      $('#f_valimage').value = pool[Math.floor(Math.random() * pool.length)].image;
-    }
   }catch(e){}
   onValidationImageChange();
   applyTriggerToPrompts();
