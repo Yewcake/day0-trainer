@@ -660,7 +660,33 @@ DEFAULT_CAPTION_INSTRUCTION = (
 )
 
 
-def _caption_worker(name: str, instruction: str, model: str, trigger: str, only_missing: bool, key: str) -> None:
+def wrap_ideogram4_caption(text: str, trigger: str) -> dict:
+    """Ports the caption JSON shape diffusion-pipe's Ideogram4 config expects (see
+    IDEOGRAM/Train_Ideogram4_DiffusionPipe_FIXED.sh's wrap_plain_caption). Built
+    deterministically in Python rather than asking Gemini to emit JSON directly --
+    VLMs are unreliable at exact bbox coordinates and hex color codes."""
+    text = text.strip()
+    if trigger and trigger not in text:
+        text = f"{trigger}, {text}"
+    return {
+        "high_level_description": f"A realistic casual lifestyle photograph of {trigger} as the main character. {text}",
+        "style_description": {
+            "aesthetics": "Realistic social-media lifestyle portrait, identity-focused character reference.",
+            "lighting": "Natural available light with realistic smartphone-photo exposure.",
+            "photo": "Sharp smartphone photograph with natural facial features and visible hair detail.",
+            "medium": "Photograph.",
+            "color_palette": ["#111111", "#6B5145", "#B98972", "#E8E0D4"],
+        },
+        "compositional_deconstruction": {
+            "background": "Casual lifestyle environment, secondary to the main character.",
+            "elements": [{"type": "obj", "bbox": [150, 80, 880, 980], "desc": text}],
+        },
+    }
+
+
+def _caption_worker(
+    name: str, instruction: str, model: str, trigger: str, only_missing: bool, key: str, caption_format: str
+) -> None:
     state = _caption_runs[name]
     target = dataset_dir(name)
     images = dataset_images(target)
@@ -676,6 +702,10 @@ def _caption_worker(name: str, instruction: str, model: str, trigger: str, only_
             caption = gemini_generate(model, parts, key).replace("\n", " ").strip()
             if trigger and trigger not in caption:
                 caption = f"{trigger}, {caption}"
+            if caption_format == "ideogram4_json":
+                caption = json.dumps(
+                    wrap_ideogram4_caption(caption, trigger), ensure_ascii=False, separators=(",", ":")
+                )
             image.with_suffix(".txt").write_text(caption, encoding="utf-8")
         except Exception as exc:
             state["errors"].append(f"{image.name}: {exc}")
@@ -692,11 +722,12 @@ def caption_all(name: str, payload: dict) -> dict:
     instruction = str(payload.get("instruction") or DEFAULT_CAPTION_INSTRUCTION)
     trigger = str(payload.get("trigger_word", "")).strip()
     only_missing = bool(payload.get("only_missing", True))
+    caption_format = str(payload.get("caption_format") or "plain")
     if trigger:
         (dataset_dir(name) / ".trigger").write_text(trigger, encoding="utf-8")
     _caption_runs[name] = {"status": "starting", "cancel": False}
     thread = threading.Thread(
-        target=_caption_worker, args=(name, instruction, model, trigger, only_missing, key), daemon=True
+        target=_caption_worker, args=(name, instruction, model, trigger, only_missing, key, caption_format), daemon=True
     )
     thread.start()
     return {"started": True}
@@ -794,43 +825,64 @@ def create_job(payload: dict) -> dict:
     (directory / "config.json").write_text(json.dumps(config, indent=2))
 
     rank = int(config["rank"])
-    cmd = [
-        sys.executable, str(trainer_script),
-        "--pretrained_model_name_or_path", str(config["model_path"]),
-        "--dataset_dir", str(dataset_path),
-        "--output_dir", str(directory),
-        "--run_name", "run",
-        "--trigger_word", trigger,
-        "--resolution", str(config["resolution"]),
-        "--train_batch_size", str(config["batch_size"]),
-        "--max_train_steps", str(config["steps"]),
-        "--save_every_n_steps", str(config["save_every"]),
-        "--sample_every_n_steps", str(config["sample_every"]),
-        "--sample_num_inference_steps", str(config["sample_steps"]),
-        "--sample_inference_model", str(config["sample_inference_model"]),
-        "--sample_guidance_scale", str(config["sample_guidance_scale"]),
-        "--sample_lora_scale", "1.0" if network == "lokr" else "1.35",
-        "--sample_prompts", "||".join(prompts),
-        "--network_type", network,
-        "--rank", str(rank), "--lora_alpha", str(rank),
-        "--lokr_factor", str(config["lokr_factor"]),
-        "--lokr_full_rank", str(config["lokr_full_rank"]),
-        "--lokr_decompose_both", str(config["lokr_decompose_both"]),
-        "--learning_rate", str(config["learning_rate"]),
-        "--weight_decay", str(config["weight_decay"]),
-        "--lr_scheduler", "cosine",
-        "--lr_warmup_steps", str(config["warmup_steps"]),
-        "--target_modules", str(config["target_modules"]),
-        "--optimizer", str(config["optimizer"]),
-        "--gradient_checkpointing", str(config["gradient_checkpointing"]),
-        "--transformer_group_offload", str(config["transformer_group_offload"]),
-        "--group_offload_blocks", str(config["group_offload_blocks"]),
-        "--validation_image", safe_name(str(config["validation_image"])) if str(config["validation_image"]).strip() else "",
-        "--validation_prompt", str(config["validation_prompt"]),
-        "--seed", str(config["seed"]),
-        "--enable_wandb", "0",
-        "--masterchef_enabled", "1" if config["masterchef_enabled"] else "0",
-    ]
+    if model_entry["arch"] == "ideogram4":
+        # Different framework entirely (diffusion-pipe + DeepSpeed, not our own training
+        # loop), so it gets its own small flag set instead of the ~30 Krea2-specific ones
+        # below. --output_dir/--run_name follow the same convention as the Krea2 branch
+        # (run_dir = output_dir / run_name = directory/"run") so job_metrics()/
+        # job_checkpoints() work against this job unmodified.
+        cmd = [
+            sys.executable, str(trainer_script),
+            "--pretrained_model_name_or_path", str(config["model_path"]),
+            "--dataset_dir", str(dataset_path),
+            "--output_dir", str(directory),
+            "--run_name", "run",
+            "--trigger_word", trigger,
+            "--resolution", str(config["resolution"]),
+            "--max_train_steps", str(config["steps"]),
+            "--save_every_n_steps", str(config["save_every"]),
+            "--rank", str(rank),
+            "--learning_rate", str(config["learning_rate"]),
+            "--seed", str(config["seed"]),
+        ]
+    else:
+        cmd = [
+            sys.executable, str(trainer_script),
+            "--pretrained_model_name_or_path", str(config["model_path"]),
+            "--dataset_dir", str(dataset_path),
+            "--output_dir", str(directory),
+            "--run_name", "run",
+            "--trigger_word", trigger,
+            "--resolution", str(config["resolution"]),
+            "--train_batch_size", str(config["batch_size"]),
+            "--max_train_steps", str(config["steps"]),
+            "--save_every_n_steps", str(config["save_every"]),
+            "--sample_every_n_steps", str(config["sample_every"]),
+            "--sample_num_inference_steps", str(config["sample_steps"]),
+            "--sample_inference_model", str(config["sample_inference_model"]),
+            "--sample_guidance_scale", str(config["sample_guidance_scale"]),
+            "--sample_lora_scale", "1.0" if network == "lokr" else "1.35",
+            "--sample_prompts", "||".join(prompts),
+            "--network_type", network,
+            "--rank", str(rank), "--lora_alpha", str(rank),
+            "--lokr_factor", str(config["lokr_factor"]),
+            "--lokr_full_rank", str(config["lokr_full_rank"]),
+            "--lokr_decompose_both", str(config["lokr_decompose_both"]),
+            "--learning_rate", str(config["learning_rate"]),
+            "--weight_decay", str(config["weight_decay"]),
+            "--lr_scheduler", "cosine",
+            "--lr_warmup_steps", str(config["warmup_steps"]),
+            "--target_modules", str(config["target_modules"]),
+            "--optimizer", str(config["optimizer"]),
+            "--gradient_checkpointing", str(config["gradient_checkpointing"]),
+            "--transformer_group_offload", str(config["transformer_group_offload"]),
+            "--group_offload_blocks", str(config["group_offload_blocks"]),
+            "--validation_image", safe_name(str(config["validation_image"])) if str(config["validation_image"]).strip() else "",
+            "--validation_prompt", str(config["validation_prompt"]),
+            "--seed", str(config["seed"]),
+            "--enable_wandb", "0",
+            "--masterchef_enabled", "1" if config["masterchef_enabled"] else "0",
+        ]
 
     env = os.environ.copy()
     hf_token = str(payload.get("hf_token", "")).strip() or load_settings().get("hf_token") or env.get("HF_TOKEN", "")

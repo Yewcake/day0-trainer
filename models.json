@@ -26,6 +26,15 @@
       "default_path": "",
       "networks": ["lora", "lokr"],
       "enabled": false
+    },
+    {
+      "id": "ideogram4",
+      "label": "Ideogram 4",
+      "arch": "ideogram4",
+      "trainer": "trainer/train_ideogram4.py",
+      "default_path": "Comfy-Org/Ideogram-4",
+      "networks": ["lora"],
+      "enabled": true
     }
   ]
 }

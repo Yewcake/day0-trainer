@@ -259,7 +259,7 @@ async function showTrain(){
   $('#main').innerHTML = `
   <h2>New training</h2>
   <div class="card"><form id="jobform" onsubmit="return submitJob(event)">
-    <div class="row"><label>Model</label><select id="f_model">
+    <div class="row"><label>Model</label><select id="f_model" onchange="onModelChange()">
       ${models.map(m=>`<option value="${m.id}" ${m.enabled?'':'disabled'}>${m.label}</option>`).join('')}
     </select></div>
     <div class="row"><label>Hugging Face token</label>
@@ -272,7 +272,7 @@ async function showTrain(){
     <div class="row"><label>Validation image</label><select id="f_valimage" onchange="onValidationImageChange()"><option value="">None (skip validation)</option></select></div>
     <div class="row" id="row-valprompt" style="display:none"><label>Validation prompt</label><input id="f_valprompt" value=""></div>
     <div class="row"><label>Network</label><select id="f_network" onchange="$('#jobform').classList.toggle('is-lokr',this.value==='lokr'); if(!$('#f_unlock').checked) applyProvenSettings();">
-      <option value="lora">LoRA</option><option value="lokr">LoKr</option></select></div>
+      <option value="lora">LoRA</option><option id="f_network_lokr_opt" value="lokr">LoKr</option></select></div>
     <div class="row"><label>Settings</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_unlock" style="width:auto" onchange="toggleAdvancedLock()">Show and modify training settings</label>
     </div>
@@ -306,13 +306,14 @@ async function showTrain(){
     <div class="row"><label>Auto-analyze</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_autoanalyze" style="width:auto" checked>Automatically analyze with Gemini when training finishes</label>
     </div>
-    <div class="row"><label>Masterchef</label>
+    <div class="row" id="row-masterchef"><label>Masterchef</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_masterchef" style="width:auto">🧪 Masterchef Cooking (experimental) — detect and throttle problem images while training</label>
     </div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
     <div style="margin-top:14px"><button class="primary" type="submit">Start training</button></div>
   </form></div>`;
+  window._models = models;
   const sets = await api('/api/datasets');
   window._datasetSets = sets;
   $('#f_dataset').innerHTML = sets.map(d=>`<option value="${d.name}">${d.name} (${d.images} images, ${d.captioned} captioned)</option>`).join('')
@@ -322,6 +323,28 @@ async function showTrain(){
   await onDatasetChange();
   applyTriggerToPrompts();
   updateScheduleDisplay();
+  onModelChange();
+}
+
+// Ideogram4 trains via a completely different framework (diffusion-pipe/DeepSpeed,
+// not our own loop) -- it only supports LoRA (no LoKr adapter type), and Masterchef
+// Cooking is wired into our own trainer's loop specifically, so neither applies.
+function onModelChange(){
+  const models = window._models || [];
+  const entry = models.find(m => m.id === $('#f_model').value);
+  const isIdeogram4 = !!entry && entry.arch === 'ideogram4';
+  const lokrOpt = $('#f_network_lokr_opt');
+  if (lokrOpt) lokrOpt.disabled = isIdeogram4;
+  if (isIdeogram4 && $('#f_network').value === 'lokr'){
+    $('#f_network').value = 'lora';
+    $('#jobform').classList.remove('is-lokr');
+  }
+  const mcRow = $('#row-masterchef');
+  if (mcRow) mcRow.style.display = isIdeogram4 ? 'none' : '';
+  if (isIdeogram4){
+    const mc = $('#f_masterchef');
+    if (mc) mc.checked = false;
+  }
 }
 
 // Cosine is the only scheduler this trainer supports (--lr_scheduler has one choice), so
@@ -598,6 +621,8 @@ async function openDataset(name){
         <textarea id="cap_instruction" style="min-height:110px">${def.instruction}</textarea></div>
       <div class="row"><label>Scope</label><select id="cap_scope">
         <option value="1">Only images without a caption</option><option value="0">All images (overwrite)</option></select></div>
+      <div class="row"><label>Caption format</label><select id="cap_format">
+        <option value="plain">Plain text</option><option value="ideogram4_json">JSON (Ideogram4)</option></select></div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
         <button class="primary" type="button" onclick="captionAll('${name}')">Caption images</button>
         <button type="button" onclick="cancelCaption('${name}')">Cancel</button>
@@ -954,6 +979,7 @@ async function captionAll(name){
     await post(`/api/datasets/${encodeURIComponent(name)}/caption-all`, {
       model: $('#cap_model').value, instruction: $('#cap_instruction').value,
       trigger_word: $('#cap_trigger').value.trim(), only_missing: $('#cap_scope').value==='1',
+      caption_format: $('#cap_format').value,
     });
   }catch(e){ toast(e.message); return; }
   clearInterval(capTimer);
