@@ -310,7 +310,7 @@ async function showTrain(){
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_masterchef" style="width:auto">🧪 Masterchef Cooking (experimental) — detect and throttle problem images while training</label>
     </div>
     <div class="row" id="row-text-fusion"><label>Text fusion layers</label>
-      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_include_text_fusion" style="width:auto">Include text_fusion layers in training (off by default — excluding them is smaller and more flexible, and is the proven, ComfyUI-compatible setting; including them is experimental and may produce a LoRA that doesn't load correctly in ComfyUI)</label>
+      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_include_text_fusion" style="width:auto">Off = more flexible (smaller, proven, ComfyUI-compatible — recommended default). On = include text_fusion layers, an experimental, larger LoRA that may not load correctly in ComfyUI</label>
     </div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
