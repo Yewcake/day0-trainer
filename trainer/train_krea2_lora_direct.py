@@ -769,10 +769,10 @@ def resolve_target_modules(
         targets = block_targets or [name for name in candidates if not name.startswith(("text_fusion.", "txtfusion.", "text_fusion_transformer."))]
     else:
         # Character/identity: main denoising blocks only by default -- an earlier version of
-        # this trainer excluded text_fusion.* here specifically because LoRAs that included it
-        # produced checkpoints that didn't patch/apply correctly when loaded in ComfyUI. Smaller
-        # file too. --include_text_fusion is an explicit opt-in for anyone who wants to
-        # experiment with the larger, deeper-binding variant anyway.
+        # this trainer excluded text_fusion.* here and it produced a smaller, more flexible
+        # LoRA (our own finding, not a ComfyUI-compatibility fix -- including text_fusion is
+        # the standard behavior elsewhere and loads fine too, just bigger and less flexible).
+        # --include_text_fusion is an explicit opt-in for anyone who wants that variant anyway.
         targets = list(block_targets)
         if include_text_fusion:
             for name in txtfusion_targets:
