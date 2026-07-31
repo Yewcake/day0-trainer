@@ -1017,7 +1017,7 @@ async function openJob(id){
       <button class="danger" onclick="stopJob('${id}')">Stop</button>
       <button class="danger" onclick="deleteJob('${id}')">Delete</button></div>
     <div class="card chartwrap"><canvas id="chart" height="250"></canvas>
-      <div class="chart-legend">loss · <b>ema</b> · <span style="opacity:.6">min/max band</span><span id="chart-legend-val" style="display:none"> · <b style="color:var(--err)">val loss</b></span></div>
+      <div class="chart-legend">loss · <b>ema</b> · <span style="opacity:.6">min/max band</span><span id="chart-legend-val" style="display:none"> · <b style="color:var(--err)">val loss</b></span><span id="chart-legend-lr" style="display:none"> · <b style="color:#4aa8e6">lr</b></span></div>
       <div class="statline" id="statline"></div></div>
     <div id="analysis"></div>
     <h3>Samples</h3><div class="samples" id="samples"><div class="empty">No samples yet.</div></div>
@@ -1084,7 +1084,11 @@ async function drawMetrics(id){
   // val_loss is sparse (only logged at checkpoint cadence) and deterministic (same held-out
   // image/noise/seed every time), unlike the noisy per-step training loss -- the cleaner signal.
   const valPoints = pts.map((p,i)=>({i, v:p.val_loss})).filter(p=>p.v!=null && !isNaN(p.v));
-  const pad = {l:46,r:10,t:12,b:22};
+  // Learning rate as a second, independently-scaled line on its own right-hand axis -- lr and
+  // loss live on wildly different magnitudes (1e-4 vs 1e-1), so they can't share a y-axis.
+  const lrPoints = pts.map((p,i)=>({i, v:p.lr})).filter(p=>p.v!=null && !isNaN(p.v));
+  const LR_COLOR = '#4aa8e6';
+  const pad = {l:46, r: lrPoints.length ? 54 : 10, t:12, b:22};
   // Scale the y-axis to the EMA trend (+ val_loss), not raw per-step loss -- raw loss spikes
   // (single-image batches, random timesteps) used to stretch the axis so far that the actual
   // decline got compressed into a sliver near the bottom. Raw loss/envelope still draw at full
@@ -1095,14 +1099,29 @@ async function drawMetrics(id){
   const span = (hi - lo) || (hi * 0.1) || 1;
   lo = Math.max(0, lo - span * 0.08);
   hi = hi + span * 0.08;
+  let lrLo = 0, lrHi = 1;
+  if (lrPoints.length){
+    lrLo = Math.min(...lrPoints.map(p=>p.v)); lrHi = Math.max(...lrPoints.map(p=>p.v));
+    const lrSpan = (lrHi - lrLo) || (lrHi * 0.1) || 1;
+    lrLo = Math.max(0, lrLo - lrSpan * 0.08);
+    lrHi = lrHi + lrSpan * 0.08;
+  }
   const x = i => pad.l + (W-pad.l-pad.r)*(i/(pts.length-1||1));
   const y = v => pad.t + (H-pad.t-pad.b)*(1-Math.min(1,Math.max(0,(v-lo)/((hi-lo)||1))));
+  const yLr = v => pad.t + (H-pad.t-pad.b)*(1-Math.min(1,Math.max(0,(v-lrLo)/((lrHi-lrLo)||1))));
   const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
   ctx.strokeStyle = css('--line'); ctx.fillStyle = css('--muted'); ctx.font='11px '+css('--mono'); ctx.lineWidth=1;
   for(let g=0; g<=4; g++){
     const gy = pad.t+(H-pad.t-pad.b)*g/4;
     ctx.beginPath(); ctx.moveTo(pad.l,gy); ctx.lineTo(W-pad.r,gy); ctx.stroke();
     ctx.fillText((hi-(hi-lo)*g/4).toFixed(3), 4, gy+3);
+  }
+  if (lrPoints.length){
+    ctx.fillStyle = LR_COLOR;
+    for(let g=0; g<=4; g++){
+      const gy = pad.t+(H-pad.t-pad.b)*g/4;
+      ctx.fillText((lrHi-(lrHi-lrLo)*g/4).toExponential(1), W-pad.r+6, gy+3);
+    }
   }
   ctx.fillText(String(steps[0]), pad.l, H-6); ctx.fillText(String(steps.at(-1)), W-pad.r-36, H-6);
   if (loss.length > 1){
@@ -1124,7 +1143,13 @@ async function drawMetrics(id){
     ctx.fillStyle = css('--err');
     valPoints.forEach(p=>{ ctx.beginPath(); ctx.arc(x(p.i), y(p.v), 2.5, 0, Math.PI*2); ctx.fill(); });
   }
+  if (lrPoints.length > 1){
+    ctx.lineWidth=1.5; ctx.strokeStyle = LR_COLOR; ctx.globalAlpha = 0.85; ctx.beginPath();
+    lrPoints.forEach((p,idx)=> idx?ctx.lineTo(x(p.i),yLr(p.v)):ctx.moveTo(x(p.i),yLr(p.v))); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
   $('#chart-legend-val').style.display = valPoints.length ? '' : 'none';
+  $('#chart-legend-lr').style.display = lrPoints.length ? '' : 'none';
   const last = pts.at(-1);
   const lastVal = valPoints.length ? valPoints.at(-1).v : null;
   const stepLabel = data.total_steps ? `${last.step}/${data.total_steps}` : String(last.step);
