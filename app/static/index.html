@@ -601,9 +601,10 @@ async function handleFiles(files){
 async function renderDatasetList(){
   const sets = await api('/api/datasets');
   $('#dslist').innerHTML = sets.length ? `<div class="card" style="padding:0"><table>
-    <tr><th>Name</th><th>Images</th><th>Captioned</th><th></th><th></th></tr>
+    <tr><th>Name</th><th>Images</th><th>Captioned</th><th></th><th></th><th></th></tr>
     ${sets.map(d=>`<tr><td>${d.name}</td><td>${d.images}</td><td>${d.captioned}</td>
       <td><a href="#" onclick="openDataset('${d.name}');return false">open</a></td>
+      <td><a href="/api/datasets/${encodeURIComponent(d.name)}/export?t=${encodeURIComponent(TOKEN)}" download="${d.name}.zip">export zip</a></td>
       <td><a href="#" style="color:var(--err)" onclick="deleteDataset('${d.name}');return false">delete</a></td></tr>`).join('')}
   </table></div>` : '<div class="empty">No datasets yet.</div>';
 }
@@ -642,6 +643,7 @@ async function openDataset(name){
       <span class="hint" id="selCount">0 selected</span>
       <div class="spacer"></div>
       <button type="button" onclick="enhanceSelected('${name}')">✦ Enhance selected</button>
+      <a href="/api/datasets/${encodeURIComponent(name)}/export?t=${encodeURIComponent(TOKEN)}" download="${name}.zip"><button type="button">⬇ Export ZIP</button></a>
       <button type="button" class="primary" onclick="saveAllCaptions('${name}')">Save dataset</button></div>
     <div class="enh-panel" id="enhancePanel">
       <div class="modal-title" style="margin-bottom:8px">Enhance queue</div>

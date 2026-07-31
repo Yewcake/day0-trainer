@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -26,6 +27,7 @@ from pathlib import Path
 import requests
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 from . import enhance
 from PIL import Image
@@ -354,6 +356,31 @@ def delete_dataset(name: str) -> dict:
         raise HTTPException(status_code=404, detail="Dataset not found.")
     shutil.rmtree(target)
     return {"deleted": name}
+
+
+@app.get("/api/datasets/{name}/export", dependencies=[Depends(require_auth)])
+def export_dataset(name: str) -> FileResponse:
+    """Zip images + captions + trigger word so the dataset can be re-dragged into a fresh pod."""
+    target = dataset_dir(name)
+    images = dataset_images(target)
+    if not images:
+        raise HTTPException(status_code=404, detail="Dataset not found or has no images.")
+    handle, tmp_path = tempfile.mkstemp(suffix=".zip")
+    os.close(handle)
+    zip_path = Path(tmp_path)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for image in images:
+            zf.write(image, image.name)
+            caption = image.with_suffix(".txt")
+            if caption.exists():
+                zf.write(caption, caption.name)
+        trigger_file = target / ".trigger"
+        if trigger_file.exists():
+            zf.write(trigger_file, ".trigger")
+    return FileResponse(
+        zip_path, filename=f"{target.name}.zip", media_type="application/zip",
+        background=BackgroundTask(zip_path.unlink, missing_ok=True),
+    )
 
 
 @app.get("/api/datasets/{name}/items", dependencies=[Depends(require_auth)])
