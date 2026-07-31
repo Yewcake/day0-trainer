@@ -309,6 +309,9 @@ async function showTrain(){
     <div class="row" id="row-masterchef"><label>Masterchef</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_masterchef" style="width:auto">🧪 Masterchef Cooking (experimental) — detect and throttle problem images while training</label>
     </div>
+    <div class="row" id="row-text-fusion"><label>Text fusion layers</label>
+      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_include_text_fusion" style="width:auto">Include text_fusion layers in training (off by default — excluding them is smaller and more flexible, and is the proven, ComfyUI-compatible setting; including them is experimental and may produce a LoRA that doesn't load correctly in ComfyUI)</label>
+    </div>
     <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
     <div style="margin-top:14px"><button class="primary" type="submit">Start training</button></div>
@@ -341,9 +344,13 @@ function onModelChange(){
   }
   const mcRow = $('#row-masterchef');
   if (mcRow) mcRow.style.display = isIdeogram4 ? 'none' : '';
+  const tfRow = $('#row-text-fusion');
+  if (tfRow) tfRow.style.display = isIdeogram4 ? 'none' : '';
   if (isIdeogram4){
     const mc = $('#f_masterchef');
     if (mc) mc.checked = false;
+    const tf = $('#f_include_text_fusion');
+    if (tf) tf.checked = false;
   }
 }
 
@@ -481,6 +488,7 @@ async function submitJob(ev){
     validation_image: $('#f_valimage').value, validation_prompt: $('#f_valprompt').value.trim(),
     auto_analyze: $('#f_autoanalyze').checked,
     masterchef_enabled: $('#f_masterchef').checked,
+    include_text_fusion: $('#f_include_text_fusion').checked,
     sample_prompts: prompts,
   };
   try{ const job = await post('/api/jobs', payload); toast('Training started.'); openJob(job.id); }

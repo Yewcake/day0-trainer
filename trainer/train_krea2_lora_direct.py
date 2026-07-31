@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_warmup_steps", type=int, default=100)
     parser.add_argument("--lora_type", default="character", choices=["character", "style", "pose", "custom"])
     parser.add_argument("--target_modules", default="character")
+    parser.add_argument("--include_text_fusion", type=int, default=0)
     parser.add_argument("--optimizer", default="paged_adamw8bit", choices=["adamw_fused", "adamw8bit", "paged_adamw8bit", "adamw", "automagic"])
     parser.add_argument("--enable_buckets", type=int, default=1)
     parser.add_argument("--bucket_no_upscale", type=int, default=1)
@@ -704,7 +705,9 @@ def find_meta_tensors(model) -> list[str]:
     return meta_names
 
 
-def resolve_target_modules(model, target_spec: str, lora_type: str = "custom") -> list[str]:
+def resolve_target_modules(
+    model, target_spec: str, lora_type: str = "custom", include_text_fusion: bool = False
+) -> list[str]:
     spec = target_spec.strip()
     preset = spec.lower()
     lora_type = (lora_type or "custom").lower()
@@ -765,11 +768,16 @@ def resolve_target_modules(model, target_spec: str, lora_type: str = "custom") -
     if preset in {"style", "pose", "blocks", "blocks_only", "attention", "attention_only"}:
         targets = block_targets or [name for name in candidates if not name.startswith(("text_fusion.", "txtfusion.", "text_fusion_transformer."))]
     else:
-        # Character/identity: use the main denoising blocks plus Krea2 text-fusion modules when present.
+        # Character/identity: main denoising blocks only by default -- an earlier version of
+        # this trainer excluded text_fusion.* here specifically because LoRAs that included it
+        # produced checkpoints that didn't patch/apply correctly when loaded in ComfyUI. Smaller
+        # file too. --include_text_fusion is an explicit opt-in for anyone who wants to
+        # experiment with the larger, deeper-binding variant anyway.
         targets = list(block_targets)
-        for name in txtfusion_targets:
-            if name not in targets:
-                targets.append(name)
+        if include_text_fusion:
+            for name in txtfusion_targets:
+                if name not in targets:
+                    targets.append(name)
         if not targets:
             targets = candidates
 
@@ -1105,7 +1113,7 @@ def train(args: argparse.Namespace) -> None:
         print("Gradient checkpointing disabled.")
 
     target_modules = filter_targets_for_network(
-        args, resolve_target_modules(transformer, args.target_modules, args.lora_type)
+        args, resolve_target_modules(transformer, args.target_modules, args.lora_type, bool(args.include_text_fusion))
     )
     network_config = build_network_config(args, target_modules)
     if args.network_type == "lokr":

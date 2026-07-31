@@ -812,7 +812,7 @@ def create_job(payload: dict) -> dict:
         "gradient_checkpointing": 1, "transformer_group_offload": 0, "group_offload_blocks": 1,
         "weight_decay": 0.01, "lokr_decompose_both": 0,
         "validation_image": "", "validation_prompt": "", "auto_analyze": False,
-        "masterchef_enabled": False,
+        "masterchef_enabled": False, "include_text_fusion": False,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -873,6 +873,7 @@ def create_job(payload: dict) -> dict:
             "--lr_scheduler", "cosine",
             "--lr_warmup_steps", str(config["warmup_steps"]),
             "--target_modules", str(config["target_modules"]),
+            "--include_text_fusion", "1" if config["include_text_fusion"] else "0",
             "--optimizer", str(config["optimizer"]),
             "--gradient_checkpointing", str(config["gradient_checkpointing"]),
             "--transformer_group_offload", str(config["transformer_group_offload"]),
