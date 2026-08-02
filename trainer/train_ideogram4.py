@@ -161,8 +161,12 @@ def patch_ideogram4_dtype_callsite() -> None:
     text = model_file.read_text()
     old = "t_cond = self.t_embedding(t)"
     new = "t_cond = self.t_embedding(t, dtype=t.dtype)"
-    if new in text:
-        say("dtype callsite patch already present.")
+    # Upstream fixed the same bug independently at some point, but passes dtype=x.dtype
+    # (the block's input tensor) rather than dtype=t.dtype -- either is fine, the point of
+    # this patch was only ever to stop the call going out with no dtype argument at all.
+    already_safe = re.search(r"t_cond\s*=\s*self\.t_embedding\(\s*t\s*,\s*dtype\s*=", text)
+    if new in text or already_safe:
+        say("dtype callsite patch not needed -- upstream already passes an explicit dtype.")
         return
     if old not in text:
         # The reference bash script only warns and continues here, which risks
