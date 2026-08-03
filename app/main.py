@@ -122,6 +122,16 @@ def dataset_media(path: Path) -> list[Path]:
     return sorted(dataset_images(path) + dataset_videos(path), key=lambda p: p.name)
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)  # signal 0: no-op, just checks whether the PID exists and is ours to signal
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just owned by someone else -- shouldn't happen here, but not "dead"
+    return True
+
+
 def job_status(job_id: str) -> str:
     proc = _active.get(job_id)
     if proc is not None:
@@ -131,16 +141,38 @@ def job_status(job_id: str) -> str:
         _active.pop(job_id, None)
         return "finished" if code == 0 else "failed"
     status_file = job_dir(job_id) / "status.json"
-    if status_file.exists():
+    if not status_file.exists():
+        return "unknown"
+    try:
+        data = json.loads(status_file.read_text())
+    except Exception:
+        return "unknown"
+    status, pid = data.get("status"), data.get("pid")
+    # `_active` is in-memory only and empties out on every server restart -- a job that was
+    # "running" when the server went down (e.g. via the "Update trainer" restart) would otherwise
+    # be stuck reporting "running" forever, dead or not, since nothing would ever re-check it. If
+    # we have its PID, verify it's actually still alive rather than trusting the last-written status.
+    if status == "running" and pid and not _pid_alive(pid):
+        status = "failed"
+        set_status(job_id, status)
+    return status or "unknown"
+
+
+def set_status(job_id: str, status: str, pid: int | None = None) -> None:
+    payload = {"status": status, "ts": time.time()}
+    status_file = job_dir(job_id) / "status.json"
+    if pid is not None:
+        payload["pid"] = pid
+    elif status_file.exists():
+        # Preserve a previously-recorded pid (e.g. when reap_finished() updates status for a job
+        # that's still tracked in `_active` this session) instead of dropping it.
         try:
-            return json.loads(status_file.read_text())["status"]
+            existing_pid = json.loads(status_file.read_text()).get("pid")
+            if existing_pid is not None:
+                payload["pid"] = existing_pid
         except Exception:
             pass
-    return "unknown"
-
-
-def set_status(job_id: str, status: str) -> None:
-    (job_dir(job_id) / "status.json").write_text(json.dumps({"status": status, "ts": time.time()}))
+    status_file.write_text(json.dumps(payload))
 
 
 def reap_finished() -> None:
@@ -1154,22 +1186,31 @@ def create_job(payload: dict) -> dict:
     proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT,
                             cwd=str(APP_DIR), env=env, start_new_session=True)
     _active[job_id] = proc
-    set_status(job_id, "running")
+    set_status(job_id, "running", pid=proc.pid)
     return {"id": job_id, "status": "running"}
 
 
 @app.post("/api/jobs/{job_id}/stop", dependencies=[Depends(require_auth)])
 def stop_job(job_id: str) -> dict:
     proc = _active.get(job_id)
-    if proc is None or proc.poll() is not None:
+    pid = proc.pid if proc else None
+    if pid is None:
+        # Not tracked this session (e.g. the server restarted since this job started) -- fall back
+        # to the pid persisted in status.json rather than assuming a "running"-looking job that
+        # isn't in `_active` must already be dead.
+        try:
+            pid = json.loads((job_dir(job_id) / "status.json").read_text()).get("pid")
+        except Exception:
+            pid = None
+    if pid is None or not _pid_alive(pid):
         raise HTTPException(status_code=400, detail="Job is not running.")
-    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    os.killpg(os.getpgid(pid), signal.SIGTERM)
     for _ in range(50):
-        if proc.poll() is not None:
+        if not _pid_alive(pid):
             break
         time.sleep(0.1)
-    if proc.poll() is None:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    if _pid_alive(pid):
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
     _active.pop(job_id, None)
     set_status(job_id, "stopped")
     return {"id": job_id, "status": "stopped"}
