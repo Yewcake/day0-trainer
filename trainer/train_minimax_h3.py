@@ -543,8 +543,14 @@ def main() -> None:
         noisy_video = video_scheduler.scale_noise(video_latents, video_t, noise)
         video_target = video_latents - noise  # data-ward velocity, see scheduling_minimax_h3.py
 
-        noisy_video_rows = patchify_video_latents(noisy_video, patch_size)
-        target_video_rows = patchify_video_latents(video_target, patch_size)
+        # patchify_video_latents() returns (batch_size * num_patches, C) -- deliberately flattening
+        # batch into the row axis (packing.py's own docstring says so explicitly) -- but the
+        # transformer's forward() documents hidden_states as 3D, (batch_size, num_video_tokens, C).
+        # Passing the flattened 2D tensor straight through is exactly what crashed on
+        # index_copy_() expecting matching dimensionality. Since --train_batch_size is enforced to
+        # 1 here, restoring the batch dim is just unsqueeze(0), not a general reshape.
+        noisy_video_rows = patchify_video_latents(noisy_video, patch_size).unsqueeze(0)
+        target_video_rows = patchify_video_latents(video_target, patch_size).unsqueeze(0)
         empty_audio_rows = torch.zeros(batch_size, 0, transformer.config.audio_in_channels, device=device)
 
         timesteps, timestep_indices = build_row_timesteps(
