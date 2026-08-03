@@ -36,10 +36,15 @@ WHAT THIS FIRST DRAFT DELIBERATELY DOES NOT DO
 - No training-time sample video generation. Reusing the modular inference
   pipeline for periodic previews is a real chunk of work on its own (assembling
   the actual T2VABlocks graph) -- deferred rather than half-built here.
-- No app/main.py or index.html wiring, no video upload support in the dataset
-  manager (which is image-only today: thumbnailing, the enhance panel, and the
-  intake flow all assume stills). That's a separate, substantial product
-  surface change and out of scope for this script.
+- No in-loop VAE/text-encoder offload shuffling. Instead, model loading and the
+  training loop are two strictly separate phases (see main()): first the VAE +
+  text encoder run once over the whole dataset and their outputs are cached,
+  then those encoders are freed from GPU memory entirely and the transformer
+  loads only after that. The alternative -- keeping every component resident
+  for the whole run -- was the actual GPU-sizing blocker: the frozen Qwen3-VL
+  text encoder alone is a second ~33-66GB model sitting alongside the 33B
+  transformer, and captions/videos never change between steps, so re-running
+  frozen encoders on the same inputs every step would be pure waste anyway.
 
 ARCHITECTURE FACTS THIS FILE DEPENDS ON (read from source, cited inline where
 they're used):
@@ -139,8 +144,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--lr_warmup_steps", type=int, default=100)
+    # The training loop pulls one cached (clip, caption) pair per step -- batching multiple clips of
+    # different aspect ratios/lengths into one packed layout isn't implemented, so this is accepted
+    # (main.py's job form has a general Batch size field) but enforced to be 1, not silently ignored.
     parser.add_argument("--train_batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", type=int, default=1)
     parser.add_argument("--video_shift", type=float, default=12.0)  # MiniMax-H3's own default for video rows
     parser.add_argument("--audio_shift", type=float, default=3.0)  # MiniMax-H3's own default for audio rows
@@ -217,33 +224,27 @@ def load_and_prepare_clip(path, num_frames: int, resolve_canvas_size):
 
 # --------------------------------------------------------------------------
 # Model loading
+#
+# Loaded and used in two strictly separate phases, not all at once -- see the
+# "why two phases" note at the top of main(). load_encoders() covers only the
+# frozen components needed to turn (video, caption) into (latents, embeddings);
+# load_transformer() is called later, after those are cached and freed.
 # --------------------------------------------------------------------------
-def load_models(args):
+def get_device() -> "torch.device":
     import torch
-    from diffusers import AutoencoderKLMiniMaxH3, MiniMaxH3Scheduler, MiniMaxH3Transformer3DModel
-    from transformers import BitsAndBytesConfig, Qwen2TokenizerFast, Qwen3VLForConditionalGeneration
 
-    dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         warn("No CUDA device found -- this will run (uselessly slowly) on CPU. Expected on a RunPod GPU pod.")
+    return device
 
-    say("Loading MiniMax-H3 transformer (33B, LoRA training only -- do not attempt full fine-tune)...")
-    quant_config = None
-    if args.quantize_base:
-        quant_config = BitsAndBytesConfig(load_in_8bit=True)
-    transformer = MiniMaxH3Transformer3DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/transformer",
-        torch_dtype=dtype, quantization_config=quant_config,
-        # bitsandbytes quantized weights must be placed at load time via device_map -- moving them
-        # with .to() afterwards does not work. Unquantized loads are moved explicitly below instead.
-        device_map={"": device} if args.quantize_base else None,
-    )
-    if not args.quantize_base:
-        transformer = transformer.to(device)
-    transformer.requires_grad_(False)
-    if args.gradient_checkpointing:
-        transformer.enable_gradient_checkpointing()
+
+def load_encoders(args, device):
+    import torch
+    from diffusers import AutoencoderKLMiniMaxH3, MiniMaxH3Scheduler
+    from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration
+
+    dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
 
     say("Loading video VAE...")
     vae = AutoencoderKLMiniMaxH3.from_pretrained(
@@ -263,7 +264,6 @@ def load_models(args):
     )
 
     video_scheduler = MiniMaxH3Scheduler(shift=args.video_shift)
-    audio_scheduler = MiniMaxH3Scheduler(shift=args.audio_shift)
 
     if args.train_audio:
         # The training loop below has no real audio waveform extraction/encoding path yet (see the
@@ -276,7 +276,31 @@ def load_models(args):
             "(the default) for video-only style/motion LoRAs."
         )
 
-    return transformer, vae, text_encoder, tokenizer, video_scheduler, audio_scheduler
+    return vae, text_encoder, tokenizer, video_scheduler
+
+
+def load_transformer(args, device):
+    import torch
+    from diffusers import MiniMaxH3Transformer3DModel
+    from transformers import BitsAndBytesConfig
+
+    dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
+
+    say("Loading MiniMax-H3 transformer (33B, LoRA training only -- do not attempt full fine-tune)...")
+    quant_config = BitsAndBytesConfig(load_in_8bit=True) if args.quantize_base else None
+    transformer = MiniMaxH3Transformer3DModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/transformer",
+        torch_dtype=dtype, quantization_config=quant_config,
+        # bitsandbytes quantized weights must be placed at load time via device_map -- moving them
+        # with .to() afterwards does not work. Unquantized loads are moved explicitly below instead.
+        device_map={"": device} if args.quantize_base else None,
+    )
+    if not args.quantize_base:
+        transformer = transformer.to(device)
+    transformer.requires_grad_(False)
+    if args.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+    return transformer
 
 
 def inject_lora(transformer, rank: int, alpha: int):
@@ -322,9 +346,47 @@ def sample_shifted_sigma(shift: float, batch_size: int, device) -> "torch.Tensor
     return shift * base / (1 + (shift - 1) * base)
 
 
+def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_canvas_size):
+    """Run the frozen VAE + text encoder once over the whole dataset and cache their outputs on
+    CPU. Captions and videos are static across the whole run (no augmentation), so re-running these
+    two frozen, ~10-65GB-each models every single step would be pure waste even with infinite VRAM --
+    and freeing them afterwards (see main()) is what makes a single 80GB GPU realistic at all."""
+    import torch
+
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1, 1)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1, 1)
+    latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+    latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+
+    cache = []
+    with torch.no_grad():
+        for i, (path, caption) in enumerate(clips):
+            pixels = load_and_prepare_clip(path, args.num_frames, resolve_canvas_size).unsqueeze(0).to(device)
+            vae_input = (pixels.to(torch.float32) - imagenet_mean) / imagenet_std
+            video_latents = vae.encode(vae_input).latent_dist.sample()
+            video_latents = (video_latents - latents_mean) / latents_std
+
+            full_caption = f"{args.trigger_word}, {caption}" if args.trigger_word and args.trigger_word not in caption else caption
+            text_ids = tokenizer([full_caption], return_tensors="pt", truncation=True).to(device)
+            text_out = text_encoder.model(
+                input_ids=text_ids["input_ids"], attention_mask=text_ids["attention_mask"],
+                pixel_values=None, output_hidden_states=True,
+            )
+            text_embeds = text_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
+
+            cache.append((video_latents.cpu(), text_embeds.cpu()))
+            say(f"Cached {i + 1}/{len(clips)}: {path.name}")
+    return cache
+
+
 def main() -> None:
     setup_environment()
     args = parse_args()
+    if args.train_batch_size != 1:
+        raise NotImplementedError(
+            f"--train_batch_size {args.train_batch_size} is not supported yet -- the training loop "
+            "pulls one cached clip per step (see precompute_cache()/main()). Leave it at 1."
+        )
 
     import torch
     from diffusers.modular_pipelines.minimax_h3.packing import (
@@ -333,7 +395,6 @@ def main() -> None:
         patchify_video_latents,
         resolve_canvas_size,
     )
-    from torch.utils.data import DataLoader, Dataset
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -346,12 +407,25 @@ def main() -> None:
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     metrics_file = run_dir / "metrics.jsonl"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    transformer, vae, text_encoder, tokenizer, video_scheduler, _audio_scheduler = load_models(args)
-    transformer = inject_lora(transformer, args.rank, args.lora_alpha)
-
+    device = get_device()
     clips = dataset_clips(dataset_dir, args.caption_extension)
     say(f"Dataset: {len(clips)} (video, caption) pairs from {dataset_dir}")
+
+    # Phase 1: encode everything, then free the encoders. Peak memory here is VAE (~10GB fp32) +
+    # text encoder (~33-66GB depending on --base_dtype) -- no transformer, no gradients, no
+    # optimizer state, since this is a forward-only pass over frozen models.
+    vae, text_encoder, tokenizer, video_scheduler = load_encoders(args, device)
+    cache = precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_canvas_size)
+    say("Freeing VAE + text encoder from GPU memory (cached outputs live on CPU now)...")
+    del vae, text_encoder, tokenizer
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Phase 2: the transformer loads only now. Peak memory here is the transformer (~33GB int8) +
+    # LoRA + activations/gradients for backprop -- comfortably within a single 80GB GPU, which
+    # phase 1 (both encoders resident at once) would not have been.
+    transformer = load_transformer(args, device)
+    transformer = inject_lora(transformer, args.rank, args.lora_alpha)
 
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
     say(f"Trainable LoRA params: {sum(p.numel() for p in trainable_params):,}")
@@ -362,60 +436,24 @@ def main() -> None:
         * (0.5 * (1 + math.cos(math.pi * step / max(1, args.max_train_steps)))),
     )
 
-    class ClipDataset(Dataset):
-        def __len__(self):
-            return len(clips)
-
-        def __getitem__(self, idx):
-            path, caption = clips[idx]
-            pixels = load_and_prepare_clip(path, args.num_frames, resolve_canvas_size)
-            if args.trigger_word and args.trigger_word not in caption:
-                caption = f"{args.trigger_word}, {caption}"
-            return pixels, caption
-
-    loader = DataLoader(ClipDataset(), batch_size=args.train_batch_size, shuffle=True, num_workers=2)
-    data_iter = iter(loader)
-
-    def next_batch():
-        nonlocal data_iter
-        try:
-            return next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            return next(data_iter)
-
     say(f"Starting training: {args.max_train_steps} steps, batch size {args.train_batch_size}.")
     transformer.train()
     global_step = 0
+    order = list(range(len(cache)))
     while global_step < args.max_train_steps:
-        pixels, captions = next_batch()
-        pixels = pixels.to(device)
-
-        with torch.no_grad():
-            # ImageNet normalization + latents_mean/std per autoencoder_kl_minimax_h3.py's own convention.
-            imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1, 1)
-            imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1, 1)
-            vae_input = (pixels.to(torch.float32) - imagenet_mean) / imagenet_std
-            latent_dist = vae.encode(vae_input).latent_dist
-            video_latents = latent_dist.sample()
-            latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
-            latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
-            video_latents = (video_latents - latents_mean) / latents_std
-
-            text_ids = tokenizer(list(captions), return_tensors="pt", padding=True, truncation=True).to(device)
-            text_out = text_encoder.model(
-                input_ids=text_ids["input_ids"], attention_mask=text_ids["attention_mask"],
-                pixel_values=None, output_hidden_states=True,
-            )
-            text_embeds = text_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(dtype=video_latents.dtype)
-            text_token_tags = torch.ones(text_embeds.shape[1], dtype=torch.long)  # 1 = text (no keyframe vision blocks)
+        if global_step % len(cache) == 0:
+            random.shuffle(order)
+        video_latents, text_embeds = cache[order[global_step % len(cache)]]
+        video_latents = video_latents.to(device)
+        text_embeds = text_embeds.to(device, dtype=torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16)
+        text_token_tags = torch.ones(text_embeds.shape[1], dtype=torch.long)  # 1 = text (no keyframe vision blocks)
 
         batch_size = video_latents.shape[0]
         patch_size = transformer.config.patch_size
         _, _, num_latent_frames, latent_height, latent_width = video_latents.shape
 
         # num_audio_latents=0 -> no audio rows at all in the packed sequence (not silence, just absent).
-        # --train_audio always raises in load_models() before reaching here -- see that function's
+        # --train_audio always raises in load_encoders() before reaching here -- see that function's
         # docstring for why "train on silence" would be worse than not training audio at all.
         layout = build_packed_sequence(
             text_token_tags=text_token_tags,
