@@ -113,11 +113,23 @@ def align_num_frames(num_frames: int) -> int:
 # --------------------------------------------------------------------------
 def setup_environment() -> None:
     say(f"Installing diffusers @ {DIFFUSERS_MINIMAX_H3_COMMIT} (minimax-h3 branch, not yet released to PyPI)...")
+    # The base Docker image already ships a released diffusers (for the Krea2/Ideogram4 trainers).
+    # Without --upgrade --force-reinstall, `pip install git+URL` silently no-ops when it considers
+    # any version of the package already installed -- it does NOT rebuild from the pinned commit
+    # just because a VCS URL was given. diffusers' own setup.py dependencies (Pillow, numpy, regex,
+    # requests, huggingface-hub, safetensors...) are lightweight and don't touch torch, so letting
+    # pip resolve them normally (no --no-deps) is safe and covers anything this unreleased branch
+    # might have newly added.
     run([
-        sys.executable, "-m", "pip", "install", "-q",
+        sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--force-reinstall",
         f"git+https://github.com/huggingface/diffusers.git@{DIFFUSERS_MINIMAX_H3_COMMIT}",
     ])
-    run([sys.executable, "-m", "pip", "install", "-q", "peft>=0.13", "accelerate", "torchvision", "torchaudio", "bitsandbytes"])
+    # MiniMaxH3Qwen3VLHFEncoder needs Qwen3VLForConditionalGeneration -- a recent enough
+    # `transformers` to even have that class, which the base image's pinned version predates.
+    run([
+        sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+        "transformers", "peft>=0.13", "accelerate", "torchvision", "torchaudio", "bitsandbytes",
+    ])
 
 
 def parse_args() -> argparse.Namespace:
