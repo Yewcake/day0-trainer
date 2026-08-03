@@ -176,7 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio_shift", type=float, default=3.0)  # MiniMax-H3's own default for audio rows
     parser.add_argument("--train_audio", type=int, default=0)  # 0 = video+text only; see module docstring
     parser.add_argument("--base_dtype", default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--quantize_base", type=int, default=1)  # int8 frozen base; ~33B model, LoRA-only fits nothing else
+    parser.add_argument("--quantize_base", type=int, default=1)  # 4-bit (nf4) frozen base; ~33B model, LoRA-only fits nothing else
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--caption_extension", default=".txt")
     return parser.parse_args()
@@ -354,8 +354,22 @@ def load_transformer(args, device):
     # weights instead of ~33GB fully quantized), not a rounding error -- still fits an 80GB GPU
     # with LoRA/activation headroom to spare, just not as comfortably as the fully-quantized
     # estimate suggested. Worth knowing if VRAM ever gets tight on a smaller card.
+    # Live run confirmed int8 quantization + the boundary-module skip list works correctly (training
+    # actually reached a real forward/backward pass) but still hit a near-total OOM on a ~95GB GPU --
+    # 94.5-94.6GB used regardless of whether clips were 73 or 22 frames, which rules out sequence
+    # length/activation memory as the driver and points at the static weights themselves (~46GB) plus
+    # int8 dequantization overhead (bitsandbytes materializes a full fp16 buffer per weight matrix
+    # during each matmul -- these are huge matrices, e.g. the SwiGLU proj is 5376x28672). Switching to
+    # 4-bit (nf4, double-quantized) roughly halves the quantized portion again on top of that.
+    # llm_int8_skip_modules applies to 4-bit skipping too despite the name (a carried-over field from
+    # when only int8 was supported) -- same skip list, same reasoning: none of those modules do the
+    # weight.dtype self-referential cast, so quantizing them wasn't unsafe, just previously unhelpful
+    # to change without knowing whether it'd be enough.
     quant_config = BitsAndBytesConfig(
-        load_in_8bit=True,
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=dtype,
         llm_int8_skip_modules=[
             "proj_in", "audio_proj_in", "context_embedder", "time_embedder",
             "proj_out", "audio_proj_out", "adaln_proj", "norm_out", "rope",
@@ -391,8 +405,8 @@ def inject_lora(transformer, rank: int, alpha: int):
     # module ("ff.net.0" is that wrapper, a non-Linear; the actual nn.Linear is "ff.net.0.proj").
     # Matching bare "ff.net.<digit>" caught the wrapper itself and PEFT rejected it outright ("Target
     # module SwiGLU(...) is not supported"). Checking isinstance(nn.Linear) directly -- true for
-    # bitsandbytes' Linear8bitLt too, since it subclasses nn.Linear -- avoids this whole class of
-    # "guessed the wrong thing from a name" bug instead of just special-casing swiglu specifically.
+    # bitsandbytes' Linear8bitLt and Linear4bit too, since both subclass nn.Linear -- avoids this
+    # whole class of "guessed the wrong thing from a name" bug instead of just special-casing swiglu.
     target_modules = []
     for name, module in transformer.named_modules():
         if not name.startswith("transformer_blocks.") or not isinstance(module, torch.nn.Linear):
@@ -500,9 +514,11 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Phase 2: the transformer loads only now. Peak memory here is the transformer (~33GB int8) +
-    # LoRA + activations/gradients for backprop -- comfortably within a single 80GB GPU, which
-    # phase 1 (both encoders resident at once) would not have been.
+    # Phase 2: the transformer loads only now. Peak memory here is the transformer (4-bit quantized,
+    # minus the boundary modules kept unquantized -- see load_transformer()'s own comments for why
+    # that's a bigger chunk than it sounds) + LoRA + activations/gradients for backprop. Phase 1
+    # (both encoders resident at once) would not have fit on the same GPU as phase 2's peak either
+    # way, which is the actual reason these are two separate phases, not one combined estimate.
     transformer = load_transformer(args, device)
     transformer = inject_lora(transformer, args.rank, args.lora_alpha)
 
