@@ -269,7 +269,7 @@ async function showTrain(){
       </div></div>
     <div class="row"><label>Dataset</label><select id="f_dataset" onchange="onDatasetChange()"></select></div>
     <div class="row"><label>Trigger word</label><input id="f_trigger" value="" oninput="applyTriggerToPrompts()"></div>
-    <div class="row"><label>Validation image</label><select id="f_valimage" onchange="onValidationImageChange()"><option value="">None (skip validation)</option></select></div>
+    <div class="row" id="row-valimage"><label>Validation image</label><select id="f_valimage" onchange="onValidationImageChange()"><option value="">None (skip validation)</option></select></div>
     <div class="row" id="row-valprompt" style="display:none"><label>Validation prompt</label><input id="f_valprompt" value=""></div>
     <div class="row"><label>Network</label><select id="f_network" onchange="$('#jobform').classList.toggle('is-lokr',this.value==='lokr'); if(!$('#f_unlock').checked) applyProvenSettings();">
       <option value="lora">LoRA</option><option id="f_network_lokr_opt" value="lokr">LoKr</option></select></div>
@@ -287,8 +287,8 @@ async function showTrain(){
       </select></div>
       <div class="row lokr-only"><label>LoKr full rank</label><select id="f_fullrank"><option value="0">No (small files)</option><option value="1">Yes (max quality, huge files)</option></select></div>
       <div class="row lokr-only"><label>LoKr decompose both</label><select id="f_decompose"><option value="0">No</option><option value="1">Yes</option></select></div>
-      <div class="row"><label>Resolution</label><input id="f_res" type="number" value="1024"></div>
-      <div class="row"><label>Optimizer</label><select id="f_optimizer">
+      <div class="row" id="row-resolution"><label>Resolution</label><input id="f_res" type="number" value="1024"></div>
+      <div class="row" id="row-optimizer"><label>Optimizer</label><select id="f_optimizer">
         <option value="paged_adamw8bit" selected>Paged AdamW 8-bit (default, memory-safe)</option>
         <option value="adamw8bit">AdamW 8-bit</option>
         <option value="adamw_fused">AdamW (fused)</option>
@@ -297,13 +297,25 @@ async function showTrain(){
       </select></div>
       <div class="row"><label>Learning rate</label><input id="f_lr" value="1e-4"></div>
       <div class="row"><label>Weight decay</label><input id="f_wd" value="0.01"></div>
-      <div class="row"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1" selected>On (saves VRAM)</option></select></div>
-      <div class="row"><label>LR schedule</label><input id="f_schedule" disabled></div>
+      <div class="row" id="row-gc"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1" selected>On (saves VRAM)</option></select></div>
+      <div class="row" id="row-schedule"><label>LR schedule</label><input id="f_schedule" disabled></div>
     </div>
-    <div class="row"><label>Steps</label><input id="f_steps" type="number" value="2000" oninput="updateScheduleDisplay()"></div>
+    <div class="row" id="row-h3-partition" style="display:none"><label>Partition</label><select id="f_partition">
+      <option value="FL2VA" selected>FL2VA — plain text/image-to-video (no reference identity)</option>
+      <option value="Ref2VA">Ref2VA — reference-image-conditioned (use with a subject's reference images)</option>
+    </select></div>
+    <div class="row" id="row-h3-frames" style="display:none"><label>Clip length</label>
+      <select id="f_numframes">
+        <option value="22">~1s (22 frames)</option>
+        <option value="39">~1.5s (39 frames)</option>
+        <option value="56">~2.3s (56 frames)</option>
+        <option value="73" selected>~3s (73 frames)</option>
+        <option value="90">~3.75s (90 frames)</option>
+      </select></div>
+    <div class="row" id="row-steps"><label>Steps</label><input id="f_steps" type="number" value="2000" oninput="updateScheduleDisplay()"></div>
     <div class="row"><label>Save every</label><input id="f_save" type="number" value="250"></div>
-    <div class="row"><label>Sample every</label><input id="f_sample" type="number" value="500"></div>
-    <div class="row"><label>Auto-analyze</label>
+    <div class="row" id="row-sample-every"><label>Sample every</label><input id="f_sample" type="number" value="500"></div>
+    <div class="row" id="row-autoanalyze"><label>Auto-analyze</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_autoanalyze" style="width:auto" checked>Automatically analyze with Gemini when training finishes</label>
     </div>
     <div class="row" id="row-masterchef"><label>Masterchef</label>
@@ -312,14 +324,17 @@ async function showTrain(){
     <div class="row" id="row-text-fusion"><label>Text fusion layers</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_include_text_fusion" style="width:auto">Off = our finding — smaller, more flexible LoRA (recommended default). On = standard behavior, includes text_fusion layers, larger file — also loads fine in ComfyUI</label>
     </div>
-    <div class="row" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
+    <div class="row" id="row-sample-prompts" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
     <div style="margin-top:14px"><button class="primary" type="submit">Start training</button></div>
   </form></div>`;
   window._models = models;
   const sets = await api('/api/datasets');
   window._datasetSets = sets;
-  $('#f_dataset').innerHTML = sets.map(d=>`<option value="${d.name}">${d.name} (${d.images} images, ${d.captioned} captioned)</option>`).join('')
+  $('#f_dataset').innerHTML = sets.map(d=>{
+    const mediaLabel = d.videos ? `${d.images} images, ${d.videos} videos` : `${d.images} images`;
+    return `<option value="${d.name}">${d.name} (${mediaLabel}, ${d.captioned} captioned)</option>`;
+  }).join('')
     || '<option value="">— no datasets, add one first —</option>';
   DEFAULT_PROMPTS.forEach(p => addPrompt(p));
   toggleAdvancedLock();
@@ -332,25 +347,43 @@ async function showTrain(){
 // Ideogram4 trains via a completely different framework (diffusion-pipe/DeepSpeed,
 // not our own loop) -- it only supports LoRA (no LoKr adapter type), and Masterchef
 // Cooking is wired into our own trainer's loop specifically, so neither applies.
+//
+// MiniMax-H3 (trainer/train_minimax_h3.py) is a third, video-only framework: no LoKr,
+// no Masterchef, no text_fusion concept, and -- unlike the other two -- no sample
+// generation, no validation-image loss curve, and no Gemini auto-analyze at all (that
+// script's own docstring says why: reusing the modular inference pipeline for previews
+// is deferred work, not done yet). It adds two fields neither other model has: which of
+// the two separate FL2VA/Ref2VA checkpoints to target, and the clip length to train on.
 function onModelChange(){
   const models = window._models || [];
   const entry = models.find(m => m.id === $('#f_model').value);
   const isIdeogram4 = !!entry && entry.arch === 'ideogram4';
+  const isH3 = !!entry && entry.arch === 'minimax_h3';
+  const noLokr = isIdeogram4 || isH3;
   const lokrOpt = $('#f_network_lokr_opt');
-  if (lokrOpt) lokrOpt.disabled = isIdeogram4;
-  if (isIdeogram4 && $('#f_network').value === 'lokr'){
+  if (lokrOpt) lokrOpt.disabled = noLokr;
+  if (noLokr && $('#f_network').value === 'lokr'){
     $('#f_network').value = 'lora';
     $('#jobform').classList.remove('is-lokr');
   }
   const mcRow = $('#row-masterchef');
-  if (mcRow) mcRow.style.display = isIdeogram4 ? 'none' : '';
+  if (mcRow) mcRow.style.display = noLokr ? 'none' : '';
   const tfRow = $('#row-text-fusion');
-  if (tfRow) tfRow.style.display = isIdeogram4 ? 'none' : '';
-  if (isIdeogram4){
+  if (tfRow) tfRow.style.display = noLokr ? 'none' : '';
+  if (noLokr){
     const mc = $('#f_masterchef');
     if (mc) mc.checked = false;
     const tf = $('#f_include_text_fusion');
     if (tf) tf.checked = false;
+  }
+
+  ['row-h3-partition', 'row-h3-frames'].forEach(id => { const el = $('#'+id); if (el) el.style.display = isH3 ? '' : 'none'; });
+  ['row-resolution', 'row-optimizer', 'row-sample-every', 'row-sample-prompts',
+   'row-autoanalyze', 'row-valimage', 'row-valprompt'].forEach(id => {
+    const el = $('#'+id); if (el) el.style.display = isH3 ? 'none' : '';
+  });
+  if (isH3){
+    const auto = $('#f_autoanalyze'); if (auto) auto.checked = false;
   }
 }
 
@@ -489,6 +522,7 @@ async function submitJob(ev){
     auto_analyze: $('#f_autoanalyze').checked,
     masterchef_enabled: $('#f_masterchef').checked,
     include_text_fusion: $('#f_include_text_fusion').checked,
+    partition: $('#f_partition').value, num_frames:+$('#f_numframes').value,
     sample_prompts: prompts,
   };
   try{ const job = await post('/api/jobs', payload); toast('Training started.'); openJob(job.id); }
@@ -502,7 +536,7 @@ async function showDatasets(){
   $('#main').innerHTML = `
     <h2>Datasets</h2>
     <div class="dropzone" id="dropzone" onclick="$('#fileinput').click()">
-      Drop a folder, .zip / .rar / .7z, loose images, or .txt captions here — or click to browse
+      Drop a folder, .zip / .rar / .7z, loose images/videos, or .txt captions here — or click to browse
       <input type="file" id="fileinput" multiple style="display:none" onchange="handleFiles([...this.files])">
     </div>
     <div class="uploadstatus" id="uploadstatus" style="display:none">
@@ -568,8 +602,8 @@ function setUploadPct(pct){ $('#uploadbar').style.width = Math.max(0,Math.min(10
 
 async function handleFiles(files){
   if (!files.length) return;
-  const keep = files.filter(f=>/\.(png|jpe?g|webp|txt|zip|rar|7z)$/i.test(f.name));
-  if (!keep.length){ toast('No usable files (images, txt, zip, rar, 7z).'); return; }
+  const keep = files.filter(f=>/\.(png|jpe?g|webp|mp4|mov|mkv|webm|txt|zip|rar|7z)$/i.test(f.name));
+  if (!keep.length){ toast('No usable files (images, videos, txt, zip, rar, 7z).'); return; }
   const suggested = keep.length===1 ? keep[0].name.replace(/\.(zip|rar|7z)$/i,'') : 'dataset';
   const name = await modalPrompt('Dataset name (existing name adds to it)', {value: suggested});
   if (!name) return;
@@ -601,11 +635,14 @@ async function handleFiles(files){
 async function renderDatasetList(){
   const sets = await api('/api/datasets');
   $('#dslist').innerHTML = sets.length ? `<div class="card" style="padding:0"><table>
-    <tr><th>Name</th><th>Images</th><th>Captioned</th><th></th><th></th><th></th></tr>
-    ${sets.map(d=>`<tr><td>${d.name}</td><td>${d.images}</td><td>${d.captioned}</td>
+    <tr><th>Name</th><th>Media</th><th>Captioned</th><th></th><th></th><th></th></tr>
+    ${sets.map(d=>{
+      const mediaLabel = d.videos ? `${d.images} images, ${d.videos} videos` : `${d.images} images`;
+      return `<tr><td>${d.name}</td><td>${mediaLabel}</td><td>${d.captioned}</td>
       <td><a href="#" onclick="openDataset('${d.name}');return false">open</a></td>
       <td><a href="/api/datasets/${encodeURIComponent(d.name)}/export?t=${encodeURIComponent(TOKEN)}" download="${d.name}.zip">export zip</a></td>
-      <td><a href="#" style="color:var(--err)" onclick="deleteDataset('${d.name}');return false">delete</a></td></tr>`).join('')}
+      <td><a href="#" style="color:var(--err)" onclick="deleteDataset('${d.name}');return false">delete</a></td></tr>`;
+    }).join('')}
   </table></div>` : '<div class="empty">No datasets yet.</div>';
 }
 
@@ -685,17 +722,22 @@ async function renderItems(name){
   $('#dsgrid').innerHTML = items.map(it=>{
     const src = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(it.image)}?t=${encodeURIComponent(TOKEN)}`;
     const dims = (it.width && it.height) ? `${it.width}×${it.height} (${(it.width*it.height/1e6).toFixed(2)}MP)` : '';
+    // Videos render their thumb as a poster-frame JPEG (server-generated via ffmpeg) same as any
+    // other thumb URL -- Enhance (Flux2Klein still-image editing) doesn't apply to video items.
     return `<div class="dsitem">
       <input type="checkbox" class="selchk" data-image="${escHtml(it.image)}" onchange="updateSelCount()">
-      <img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
+      <div style="position:relative">
+        <img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
+        ${it.is_video ? '<span class="hint" style="position:absolute;top:4px;left:4px;background:rgba(0,0,0,.6);color:#fff;padding:1px 6px;border-radius:4px;font-size:10px">▶ video</span>' : ''}
+      </div>
       <textarea placeholder="no caption" data-image="${escHtml(it.image)}" data-saved="${escHtml(it.caption)}"
         onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea>
       <div class="hint" style="padding:0 8px">${dims}</div>
       <div style="padding:6px 8px 8px;display:flex;gap:6px">
-        <button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button>
+        ${it.is_video ? '' : `<button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button>`}
         <button type="button" class="small danger" onclick="deleteImage('${name}','${escHtml(it.image)}')">🗑</button>
       </div></div>`;
-  }).join('') || '<div class="empty">No images.</div>';
+  }).join('') || '<div class="empty">No media.</div>';
   updateSelCount();
 }
 

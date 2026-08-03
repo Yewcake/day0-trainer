@@ -39,6 +39,8 @@ DATASETS_DIR = WORKSPACE / "datasets"
 SETTINGS_FILE = WORKSPACE / ".day0" / "settings.json"
 UI_PASSWORD = os.environ.get("UI_PASSWORD", "")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 for directory in (JOBS_DIR, DATASETS_DIR, SETTINGS_FILE.parent):
@@ -104,6 +106,20 @@ def dataset_images(path: Path) -> list[Path]:
         p for p in path.rglob("*")
         if p.suffix.lower() in IMAGE_EXTS and DATASET_CACHE_DIRS.isdisjoint(p.relative_to(path).parts)
     )
+
+
+def dataset_videos(path: Path) -> list[Path]:
+    return sorted(
+        p for p in path.rglob("*")
+        if p.suffix.lower() in VIDEO_EXTS and DATASET_CACHE_DIRS.isdisjoint(p.relative_to(path).parts)
+    )
+
+
+def dataset_media(path: Path) -> list[Path]:
+    """Images and videos together, e.g. for listing/export -- most other call sites want just one
+    or the other (the Gemini captioner and enhance panel are image-only; MiniMax-H3 training data
+    is video-only), so this is only for the places that genuinely need both."""
+    return sorted(dataset_images(path) + dataset_videos(path), key=lambda p: p.name)
 
 
 def job_status(job_id: str) -> str:
@@ -287,13 +303,13 @@ def extract_archive(archive: Path, target: Path) -> None:
 
 
 def flatten_dataset(target: Path) -> None:
-    """Move all images (and their caption txts) to the dataset root."""
-    for image in dataset_images(target):
-        if image.parent != target:
-            destination = target / image.name
+    """Move all media files -- images and videos -- (and their caption txts) to the dataset root."""
+    for item in dataset_media(target):
+        if item.parent != target:
+            destination = target / item.name
             if not destination.exists():
-                shutil.move(str(image), destination)
-            caption = image.with_suffix(".txt")
+                shutil.move(str(item), destination)
+            caption = item.with_suffix(".txt")
             if caption.exists() and not (target / caption.name).exists():
                 shutil.move(str(caption), target / caption.name)
     for entry in list(target.iterdir()):
@@ -301,7 +317,7 @@ def flatten_dataset(target: Path) -> None:
             continue
         if entry.is_dir():
             shutil.rmtree(entry)
-        elif entry.suffix.lower() not in IMAGE_EXTS | {".txt"}:
+        elif entry.suffix.lower() not in MEDIA_EXTS | {".txt"}:
             entry.unlink()
 
 
@@ -311,11 +327,12 @@ def list_datasets() -> list[dict]:
     for entry in sorted(DATASETS_DIR.iterdir()):
         if entry.is_dir():
             images = dataset_images(entry)
-            captioned = sum(1 for img in images if img.with_suffix(".txt").exists())
+            videos = dataset_videos(entry)
+            captioned = sum(1 for item in images + videos if item.with_suffix(".txt").exists())
             trigger_file = entry / ".trigger"
             trigger_word = trigger_file.read_text(encoding="utf-8").strip() if trigger_file.exists() else ""
             out.append({
-                "name": entry.name, "images": len(images), "captioned": captioned,
+                "name": entry.name, "images": len(images), "videos": len(videos), "captioned": captioned,
                 "trigger_word": trigger_word,
             })
     return out
@@ -323,10 +340,10 @@ def list_datasets() -> list[dict]:
 
 @app.post("/api/datasets/{name}/files", dependencies=[Depends(require_auth)])
 async def add_files(name: str, files: list[UploadFile] = File(...)) -> dict:
-    """Universal intake: archives (.zip/.rar/.7z), loose images, caption txts.
+    """Universal intake: archives (.zip/.rar/.7z), loose images, videos, caption txts.
 
     The frontend flattens dropped folders into individual files before upload,
-    so a folder drop arrives here as loose images + txts.
+    so a folder drop arrives here as loose images/videos + txts.
     """
     target = dataset_dir(name)
     target.mkdir(parents=True, exist_ok=True)
@@ -342,11 +359,12 @@ async def add_files(name: str, files: list[UploadFile] = File(...)) -> dict:
             extract_archive(destination, target)
             destination.unlink()
             added_archives += 1
-        elif suffix not in IMAGE_EXTS | {".txt"}:
+        elif suffix not in MEDIA_EXTS | {".txt"}:
             destination.unlink()
     flatten_dataset(target)
     images = dataset_images(target)
-    return {"name": target.name, "images": len(images), "archives_extracted": added_archives}
+    videos = dataset_videos(target)
+    return {"name": target.name, "images": len(images), "videos": len(videos), "archives_extracted": added_archives}
 
 
 @app.delete("/api/datasets/{name}", dependencies=[Depends(require_auth)])
@@ -360,18 +378,18 @@ def delete_dataset(name: str) -> dict:
 
 @app.get("/api/datasets/{name}/export", dependencies=[Depends(require_auth)])
 def export_dataset(name: str) -> FileResponse:
-    """Zip images + captions + trigger word so the dataset can be re-dragged into a fresh pod."""
+    """Zip media (images/videos) + captions + trigger word so the dataset can be re-dragged into a fresh pod."""
     target = dataset_dir(name)
-    images = dataset_images(target)
-    if not images:
-        raise HTTPException(status_code=404, detail="Dataset not found or has no images.")
+    media = dataset_media(target)
+    if not media:
+        raise HTTPException(status_code=404, detail="Dataset not found or has no media.")
     handle, tmp_path = tempfile.mkstemp(suffix=".zip")
     os.close(handle)
     zip_path = Path(tmp_path)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for image in images:
-            zf.write(image, image.name)
-            caption = image.with_suffix(".txt")
+        for item in media:
+            zf.write(item, item.name)
+            caption = item.with_suffix(".txt")
             if caption.exists():
                 zf.write(caption, caption.name)
         trigger_file = target / ".trigger"
@@ -389,14 +407,17 @@ def dataset_items(name: str) -> list[dict]:
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="Dataset not found.")
     out = []
-    for image in dataset_images(target):
-        caption_file = image.with_suffix(".txt")
-        try:
-            width, height = Image.open(image).size  # header-only read, no full decode
-        except Exception:
-            width, height = None, None
+    for item in dataset_media(target):
+        is_video = item.suffix.lower() in VIDEO_EXTS
+        caption_file = item.with_suffix(".txt")
+        width = height = None
+        if not is_video:
+            try:
+                width, height = Image.open(item).size  # header-only read, no full decode
+            except Exception:
+                pass
         out.append({
-            "image": image.name,
+            "image": item.name, "is_video": is_video,
             "caption": caption_file.read_text(encoding="utf-8", errors="replace") if caption_file.exists() else "",
             "width": width, "height": height,
         })
@@ -407,12 +428,26 @@ def dataset_items(name: str) -> list[dict]:
 def dataset_thumb(name: str, image: str, size: int = 220) -> FileResponse:
     source = dataset_dir(name) / safe_name(image)
     if not source.is_file():
-        raise HTTPException(status_code=404, detail="Image not found.")
+        raise HTTPException(status_code=404, detail="Media not found.")
     thumbs = dataset_dir(name) / ".thumbs"
     thumbs.mkdir(exist_ok=True)
     thumb = thumbs / f"{size}_{source.name}.jpg"
     if not thumb.exists() or thumb.stat().st_mtime < source.stat().st_mtime:
-        img = Image.open(source).convert("RGB")
+        if source.suffix.lower() in VIDEO_EXTS:
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise HTTPException(status_code=500, detail="ffmpeg is required for video thumbnails but was not found.")
+            frame = thumbs / f".frame_{source.name}.jpg"
+            result = subprocess.run(
+                [ffmpeg, "-y", "-ss", "0.5", "-i", str(source), "-frames:v", "1", str(frame)],
+                capture_output=True, timeout=30,
+            )
+            if result.returncode != 0 or not frame.is_file():
+                raise HTTPException(status_code=500, detail="Could not extract a video thumbnail frame.")
+            img = Image.open(frame).convert("RGB")
+            frame.unlink(missing_ok=True)
+        else:
+            img = Image.open(source).convert("RGB")
         img.thumbnail((size, size))
         img.save(thumb, format="JPEG", quality=85)
     return FileResponse(thumb)
@@ -803,11 +838,6 @@ def create_job(payload: dict) -> dict:
     if enhance.is_ready():
         enhance.unload()  # frees its ~20GB+ before training claims the GPU
 
-    dataset = safe_name(str(payload.get("dataset", "")))
-    dataset_path = DATASETS_DIR / dataset
-    if not dataset_path.is_dir() or not dataset_images(dataset_path):
-        raise HTTPException(status_code=400, detail=f"Dataset '{dataset}' not found or empty.")
-
     model_id = str(payload.get("model_id", ""))
     model_entry = next((m for m in load_models() if m["id"] == model_id and m.get("enabled")), None)
     if model_entry is None:
@@ -815,6 +845,16 @@ def create_job(payload: dict) -> dict:
     trainer_script = APP_DIR / model_entry["trainer"]
     if not trainer_script.is_file():
         raise HTTPException(status_code=500, detail="Trainer script for this model is missing.")
+
+    dataset = safe_name(str(payload.get("dataset", "")))
+    dataset_path = DATASETS_DIR / dataset
+    # MiniMax-H3 trains on video clips, everything else on stills -- a dataset with the wrong
+    # media type for the selected model is empty as far as that trainer is concerned.
+    if model_entry["arch"] == "minimax_h3":
+        if not dataset_path.is_dir() or not dataset_videos(dataset_path):
+            raise HTTPException(status_code=400, detail=f"Dataset '{dataset}' not found or has no videos.")
+    elif not dataset_path.is_dir() or not dataset_images(dataset_path):
+        raise HTTPException(status_code=400, detail=f"Dataset '{dataset}' not found or empty.")
 
     network = payload.get("network_type", "lora")
     if network not in model_entry["networks"]:
@@ -840,6 +880,7 @@ def create_job(payload: dict) -> dict:
         "weight_decay": 0.01, "lokr_decompose_both": 0,
         "validation_image": "", "validation_prompt": "", "auto_analyze": False,
         "masterchef_enabled": False, "include_text_fusion": False,
+        "partition": "FL2VA", "num_frames": 73,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -870,6 +911,31 @@ def create_job(payload: dict) -> dict:
             "--save_every_n_steps", str(config["save_every"]),
             "--rank", str(rank),
             "--learning_rate", str(config["learning_rate"]),
+            "--seed", str(config["seed"]),
+        ]
+    elif model_entry["arch"] == "minimax_h3":
+        # A third, distinct framework: our own direct diffusers+PEFT loop (like Krea2 below), but
+        # against MiniMax-H3's own component layout -- --partition selects which of the two separate
+        # ~33B checkpoints (FL2VA vs Ref2VA) this LoRA targets, see train_minimax_h3.py's own
+        # docstring for why those aren't interchangeable. --output_dir/--run_name follow the same
+        # run_dir = output_dir/run_name convention as the other two branches.
+        cmd = [
+            sys.executable, str(trainer_script),
+            "--pretrained_model_name_or_path", str(config["model_path"]),
+            "--partition", str(config["partition"]),
+            "--dataset_dir", str(dataset_path),
+            "--output_dir", str(directory),
+            "--run_name", "run",
+            "--trigger_word", trigger,
+            "--num_frames", str(config["num_frames"]),
+            "--max_train_steps", str(config["steps"]),
+            "--save_every_n_steps", str(config["save_every"]),
+            "--rank", str(rank), "--lora_alpha", str(rank),
+            "--learning_rate", str(config["learning_rate"]),
+            "--weight_decay", str(config["weight_decay"]),
+            "--lr_warmup_steps", str(config["warmup_steps"]),
+            "--train_batch_size", str(config["batch_size"]),
+            "--gradient_checkpointing", str(config["gradient_checkpointing"]),
             "--seed", str(config["seed"]),
         ]
     else:
