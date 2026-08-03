@@ -35,4 +35,5 @@ The image is ~10GB (CUDA + PyTorch + Diffusers). Public/anonymous image pulls ar
 
 - One job at a time per pod (one GPU).
 - The Docker image only holds the heavy environment (CUDA/PyTorch/Diffusers). Trainer + UI code is pulled fresh from the public GitHub repo at boot, and can be updated live from the "Update trainer" button without a pod restart.
-- Recommended volume: 150GB+ (model cache, datasets, checkpoints all live on the pod volume).
+- Recommended container disk: 30GB+ (holds the pulled image itself).
+- Recommended volume: 150GB+, mounted at `/workspace` (model cache, datasets, checkpoints all live here).

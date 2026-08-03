@@ -50,7 +50,8 @@ This repo and its GHCR image are both public, so no credentials are needed to pu
 2. Let the GitHub Action build the image once (Actions tab → "Build and push trainer image" → Run workflow). It lands at `ghcr.io/<you>/<repo>:latest`.
 3. Create the RunPod template:
    - **Container image**: `ghcr.io/<you>/<repo>:latest`
-   - **Expose HTTP port**: `8888`
+   - **Expose HTTP port**: `8888` (plain HTTP port type — this is a custom FastAPI dashboard, not Jupyter, so don't use a "Jupyter" preset if the console offers one)
+   - **Container disk**: 30 GB+ recommended (holds the pulled image; it's ~10GB compressed but extracts larger)
    - **Volume**: mount path `/workspace`, 150 GB+ recommended (model cache, datasets, checkpoints all persist here)
    - **Environment variables**:
      - `TRAINER_REPO_URL` — this repo's clone URL (use an `https://<token>@github.com/...` URL only if your fork is private)
