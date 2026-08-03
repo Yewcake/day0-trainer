@@ -612,9 +612,26 @@ def main() -> None:
             say(f"step {global_step}/{args.max_train_steps} loss={loss.item():.4f}")
 
         if global_step % args.save_every_n_steps == 0 or global_step == args.max_train_steps:
+            # NOT transformer.save_lora_adapter() -- that method is broken for a quantized model at
+            # this diffusers commit regardless of its upcast_before_saving argument: it always calls
+            # `self.to(dtype=torch.float32 if upcast_before_saving else None)`, and modeling_utils.py's
+            # `to()` checks `dtype_present_in_args = "dtype" in kwargs` -- true whenever the *key*
+            # dtype is present at all, even set to None -- so it hits the "Casting a quantized model
+            # to a new dtype is unsupported" guard unconditionally, upcast requested or not. Live run
+            # confirmed this crashes step 25's checkpoint save after steps 1/10/20 trained correctly.
+            # Replicated the rest of that method's actual logic directly (it's just
+            # get_peft_model_state_dict + safetensors.save_file) instead of waiting on an upstream fix
+            # to an unreleased branch -- we don't want the fp32 upcast anyway, bf16 LoRA weights are
+            # standard and this sidesteps the broken call entirely rather than working around it.
+            from peft.utils import get_peft_model_state_dict
+            import safetensors.torch
+
             ckpt_dir = checkpoints_dir / f"step-{global_step:06d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            transformer.save_lora_adapter(str(ckpt_dir))
+            lora_state_dict = get_peft_model_state_dict(transformer, adapter_name="default")
+            safetensors.torch.save_file(
+                lora_state_dict, str(ckpt_dir / "pytorch_lora_weights.safetensors"), metadata={"format": "pt"}
+            )
             say(f"Saved checkpoint: {ckpt_dir}")
 
     say("Training complete.")
