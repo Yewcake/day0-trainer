@@ -190,6 +190,25 @@ def encode_image_for_gemini(path: Path, max_side: int = 1024) -> dict:
     return {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buffer.getvalue()).decode()}}
 
 
+VIDEO_MIME_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".webm": "video/webm"}
+GEMINI_INLINE_LIMIT_BYTES = 19 * 1024 * 1024  # Gemini's inline-request cap is ~20MB total; leave headroom for the prompt text.
+
+
+def encode_video_for_gemini(path: Path) -> dict:
+    """Gemini reads actual video content natively (motion across frames, not just one still), which
+    is the whole point for video training clips -- but only inline for files under its ~20MB request
+    cap. Our trim tool keeps clips to a few seconds specifically so they land well under that."""
+    size = path.stat().st_size
+    if size > GEMINI_INLINE_LIMIT_BYTES:
+        raise RuntimeError(
+            f"{path.name} is {size / 1e6:.1f}MB, too large to send to Gemini inline (~20MB limit). "
+            "Trim it shorter with the ✂ Trim tool first."
+        )
+    mime_type = VIDEO_MIME_TYPES.get(path.suffix.lower(), "video/mp4")
+    data = base64.b64encode(path.read_bytes()).decode()
+    return {"inline_data": {"mime_type": mime_type, "data": data}}
+
+
 def gemini_generate(model: str, parts: list[dict], key: str, timeout: int = 120) -> str:
     response = requests.post(
         f"{GEMINI_BASE}/models/{model}:generateContent",
@@ -878,21 +897,32 @@ def wrap_ideogram4_caption(text: str, trigger: str) -> dict:
     }
 
 
+VIDEO_MOTION_HINT = (
+    " This is a short video clip, not a still image -- Gemini can see the actual motion across "
+    "its frames, so describe what physically happens over the clip (the movement, transition, or "
+    "action) in addition to the visual details above, in the same natural positive phrasing."
+)
+
+
 def _caption_worker(
     name: str, instruction: str, model: str, trigger: str, only_missing: bool, key: str, caption_format: str
 ) -> None:
     state = _caption_runs[name]
     target = dataset_dir(name)
-    images = dataset_images(target)
+    items = dataset_media(target)
     if only_missing:
-        images = [img for img in images if not img.with_suffix(".txt").exists()]
-    state.update({"total": len(images), "done": 0, "errors": [], "status": "running"})
-    for image in images:
+        items = [item for item in items if not item.with_suffix(".txt").exists()]
+    state.update({"total": len(items), "done": 0, "errors": [], "status": "running"})
+    for item in items:
         if state.get("cancel"):
             state["status"] = "cancelled"
             return
         try:
-            parts = [{"text": instruction}, encode_image_for_gemini(image)]
+            is_video = item.suffix.lower() in VIDEO_EXTS
+            if is_video:
+                parts = [{"text": instruction + VIDEO_MOTION_HINT}, encode_video_for_gemini(item)]
+            else:
+                parts = [{"text": instruction}, encode_image_for_gemini(item)]
             caption = gemini_generate(model, parts, key).replace("\n", " ").strip()
             if trigger and trigger not in caption:
                 caption = f"{trigger}, {caption}"
@@ -900,9 +930,9 @@ def _caption_worker(
                 caption = json.dumps(
                     wrap_ideogram4_caption(caption, trigger), ensure_ascii=False, separators=(",", ":")
                 )
-            image.with_suffix(".txt").write_text(caption, encoding="utf-8")
+            item.with_suffix(".txt").write_text(caption, encoding="utf-8")
         except Exception as exc:
-            state["errors"].append(f"{image.name}: {exc}")
+            state["errors"].append(f"{item.name}: {exc}")
         state["done"] += 1
     state["status"] = "finished"
 

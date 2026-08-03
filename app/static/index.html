@@ -670,16 +670,16 @@ async function openDataset(name){
       <div class="row" style="align-items:start"><label style="padding-top:8px">Instruction</label>
         <textarea id="cap_instruction" style="min-height:110px">${def.instruction}</textarea></div>
       <div class="row"><label>Scope</label><select id="cap_scope">
-        <option value="1">Only images without a caption</option><option value="0">All images (overwrite)</option></select></div>
+        <option value="1">Only media without a caption</option><option value="0">All media (overwrite)</option></select></div>
       <div class="row"><label>Caption format</label><select id="cap_format">
         <option value="plain">Plain text</option><option value="ideogram4_json">JSON (Ideogram4)</option></select></div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
-        <button class="primary" type="button" onclick="captionAll('${name}')">Caption images</button>
+        <button class="primary" type="button" onclick="captionAll('${name}')">Caption images/videos</button>
         <button type="button" onclick="cancelCaption('${name}')">Cancel</button>
         <div class="progressbar" style="flex:1"><div id="cap_bar"></div></div>
         <span class="hint" id="cap_stat">idle</span></div>
     </div>
-    <div class="toolbar" style="margin-top:16px;margin-bottom:0"><h3 style="margin:0">Images</h3>
+    <div class="toolbar" style="margin-top:16px;margin-bottom:0"><h3 style="margin:0">Media</h3>
       <label class="hint" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="selAll" onchange="toggleSelectAll(this)" style="width:auto">Select all</label>
       <span class="hint" id="selCount">0 selected</span>
       <div class="spacer"></div>
@@ -732,7 +732,7 @@ async function renderItems(name){
       <input type="checkbox" class="selchk" data-image="${escHtml(it.image)}" onchange="updateSelCount()">
       <div style="position:relative">
         <img loading="lazy" src="${src}" alt="${it.image}" onclick="lightbox('${src}&size=1024')">
-        ${it.is_video ? '<span class="hint" style="position:absolute;top:4px;left:4px;background:rgba(0,0,0,.6);color:#fff;padding:1px 6px;border-radius:4px;font-size:10px">▶ video</span>' : ''}
+        ${it.is_video ? '<span class="hint" style="position:absolute;top:4px;right:4px;background:rgba(0,0,0,.6);color:#fff;padding:1px 6px;border-radius:4px;font-size:10px">▶ video</span>' : ''}
       </div>
       <textarea placeholder="no caption" data-image="${escHtml(it.image)}" data-saved="${escHtml(it.caption)}"
         onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea>
