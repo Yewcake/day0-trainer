@@ -1,4 +1,4 @@
-# Day0 Trainer — Krea 2 / Ideogram 4 / MiniMax H3 LoRA Trainer, by Yewcake
+# Day0 Trainer: Krea 2 / Ideogram 4 / MiniMax H3 LoRA Trainer, by Yewcake
 
 Universal direct Diffusers + PEFT trainer with a web UI. New models plug in via `models.json` + a trainer adapter. Runs as a RunPod template.
 
@@ -19,7 +19,7 @@ Universal direct Diffusers + PEFT trainer with a web UI. New models plug in via 
 
 ## Features
 
-- Model dropdown driven by `models.json` — add architectures without touching the UI
+- Model dropdown driven by `models.json`, add architectures without touching the UI
 - LoRA/LoKr with factor + full-rank options, ComfyUI-native export
 - Live loss chart (EMA smoothed), per-checkpoint sample gallery, checkpoint downloads
 - Dataset manager: drag and drop folders, .zip/.rar/.7z archives, or loose images
@@ -40,8 +40,8 @@ The Docker image contains only the heavy environment (CUDA, PyTorch, Diffusers, 
 
 This repo and its GHCR image are both public, so no credentials are needed to pull either.
 
-1. Deploy a pod from the **day0-trainer** RunPod template (or build your own from this repo — see below).
-2. When deploying, set your own **`UI_PASSWORD`** — the template does not ship with a fixed one, so leaving it unset means the UI is open to anyone with the pod's URL.
+1. Deploy a pod from the **day0-trainer** RunPod template (or build your own from this repo, see below).
+2. When deploying, set your own **`UI_PASSWORD`**: the template does not ship with a fixed one, so leaving it unset means the UI is open to anyone with the pod's URL.
 3. Open the HTTP service on port 8888, enter your password, upload a dataset, start training.
 
 ## One-time setup (building your own template)
@@ -50,14 +50,14 @@ This repo and its GHCR image are both public, so no credentials are needed to pu
 2. Let the GitHub Action build the image once (Actions tab → "Build and push trainer image" → Run workflow). It lands at `ghcr.io/<you>/<repo>:latest`.
 3. Create the RunPod template:
    - **Container image**: `ghcr.io/<you>/<repo>:latest`
-   - **Expose HTTP port**: `8888` (plain HTTP port type — this is a custom FastAPI dashboard, not Jupyter, so don't use a "Jupyter" preset if the console offers one)
+   - **Expose HTTP port**: `8888` (plain HTTP port type: this is a custom FastAPI dashboard, not Jupyter, so don't use a "Jupyter" preset if the console offers one)
    - **Container disk**: 30 GB+ recommended (holds the pulled image; it's ~10GB compressed but extracts larger)
    - **Volume**: mount path `/workspace`, 150 GB+ recommended (model cache, datasets, checkpoints all persist here)
    - **Environment variables**:
-     - `TRAINER_REPO_URL` — this repo's clone URL (use an `https://<token>@github.com/...` URL only if your fork is private)
-     - `TRAINER_REPO_BRANCH` — optional, default `main`
-     - `HF_TOKEN` — Hugging Face token for pulling Krea 2 weights
-     - `UI_PASSWORD` — access password for the web UI (leave unset to force each deployer to set their own if you publish the template)
+     - `TRAINER_REPO_URL`: this repo's clone URL (use an `https://<token>@github.com/...` URL only if your fork is private)
+     - `TRAINER_REPO_BRANCH`: optional, default `main`
+     - `HF_TOKEN`: Hugging Face token for pulling Krea 2 weights
+     - `UI_PASSWORD`: access password for the web UI (leave unset to force each deployer to set their own if you publish the template)
 
 ## Layout
 
@@ -79,7 +79,7 @@ Each run lives in `/workspace/jobs/<id>/`:
 ```
 config.json           form snapshot
 log.txt               full trainer output
-run/metrics.jsonl     per-step loss/lr — the UI chart reads this
+run/metrics.jsonl     per-step loss/lr, the UI chart reads this
 run/samples/step-*/   sample images per checkpoint
 run/checkpoints/*/krea2_comfy_native_lora.safetensors   ComfyUI-ready file
 ```
