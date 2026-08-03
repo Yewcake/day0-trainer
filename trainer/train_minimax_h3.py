@@ -352,15 +352,21 @@ def inject_lora(transformer, rank: int, alpha: int):
     block is part of the same shared self-attention stack (no modality-isolated layers to exclude
     the way Krea2's text_fusion.* could be), so the target list is simply every attention and
     feed-forward linear across all 50 transformer_blocks."""
+    import torch
     from peft import LoraConfig
 
+    # Live run caught a real bug in the previous version of this match: diffusers' FeedForward with
+    # activation_fn="swiglu" (what this transformer uses) wraps its first linear inside a SwiGLU
+    # module ("ff.net.0" is that wrapper, a non-Linear; the actual nn.Linear is "ff.net.0.proj").
+    # Matching bare "ff.net.<digit>" caught the wrapper itself and PEFT rejected it outright ("Target
+    # module SwiGLU(...) is not supported"). Checking isinstance(nn.Linear) directly -- true for
+    # bitsandbytes' Linear8bitLt too, since it subclasses nn.Linear -- avoids this whole class of
+    # "guessed the wrong thing from a name" bug instead of just special-casing swiglu specifically.
     target_modules = []
     for name, module in transformer.named_modules():
-        if not name.startswith("transformer_blocks."):
+        if not name.startswith("transformer_blocks.") or not isinstance(module, torch.nn.Linear):
             continue
-        if name.endswith((".to_q", ".to_k", ".to_v", ".to_out.0")):
-            target_modules.append(name)
-        elif ".ff.net." in name and name.split(".")[-1].isdigit():
+        if name.endswith((".to_q", ".to_k", ".to_v", ".to_out.0", ".ff.net.0.proj", ".ff.net.2")):
             target_modules.append(name)
     if not target_modules:
         raise RuntimeError(
