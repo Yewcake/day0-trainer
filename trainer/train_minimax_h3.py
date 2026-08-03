@@ -126,9 +126,13 @@ def setup_environment() -> None:
     ])
     # MiniMaxH3Qwen3VLHFEncoder needs Qwen3VLForConditionalGeneration -- a recent enough
     # `transformers` to even have that class, which the base image's pinned version predates.
+    # `av` (PyAV) is for video decoding in load_and_prepare_clip() -- not torchvision (see that
+    # function's own docstring for why) or torchaudio (no audio path exists yet), so neither is
+    # installed here; numpy is deliberately left alone too, already guaranteed present via torch
+    # and not worth the ABI-mismatch risk of force-upgrading it alongside a pinned torch build.
     run([
         sys.executable, "-m", "pip", "install", "-q", "--upgrade",
-        "transformers", "peft>=0.13", "accelerate", "torchvision", "torchaudio", "bitsandbytes",
+        "transformers", "peft>=0.13", "accelerate", "av", "bitsandbytes",
     ])
 
 
@@ -198,13 +202,24 @@ def load_and_prepare_clip(path, num_frames: int, resolve_canvas_size):
     """Read a video file, align its frame count to the nearest valid 17n+5, resize/center-crop
     to MiniMax-H3's fixed-short-edge canvas for the clip's own aspect ratio, return a
     (C, num_frames, H, W) float tensor in [0, 1] (the VAE's own encode() then applies the
-    ImageNet normalization documented in autoencoder_kl_minimax_h3.py -- not done here)."""
-    import torch
-    import torchvision
+    ImageNet normalization documented in autoencoder_kl_minimax_h3.py -- not done here).
 
-    video, _, info = torchvision.io.read_video(str(path), pts_unit="sec", output_format="TCHW")
-    video = video.float() / 255.0  # (T, C, H, W) in [0, 1]
-    source_fps = info.get("video_fps", MINIMAX_H3_FPS)
+    Decodes via PyAV rather than torchvision.io.read_video -- torchvision has been shuffling its
+    video-reading backend across releases (this trainer's own first live run hit exactly that:
+    `--upgrade`d torchvision no longer exposed read_video at all), while PyAV is a stable, narrowly-
+    scoped binding directly onto ffmpeg's own decoders and isn't subject to torchvision's churn."""
+    import av
+    import numpy as np
+    import torch
+
+    container = av.open(str(path))
+    stream = container.streams.video[0]
+    frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(stream)]  # each (H, W, 3) uint8
+    source_fps = float(stream.average_rate) if stream.average_rate else MINIMAX_H3_FPS
+    container.close()
+
+    video = torch.from_numpy(np.stack(frames)).float() / 255.0  # (T, H, W, C) in [0, 1]
+    video = video.permute(0, 3, 1, 2)  # (T, C, H, W)
 
     if abs(source_fps - MINIMAX_H3_FPS) > 0.5:
         # Nearest-frame resample to 24fps rather than requiring pre-conformed source clips.
