@@ -76,6 +76,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Must be set before any CUDA context exists (i.e. before torch is ever imported, including by
+# a dependency) to take effect at all -- live run hit a near-total OOM (94.49/94.97GB used) one
+# 1.16GB allocation short, and this is the exact mitigation PyTorch's own error message suggests
+# for allocator fragmentation. It won't manufacture memory that isn't there, but at this close to
+# the ceiling it's worth having on for free.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 WORKDIR = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 DIFFUSERS_MINIMAX_H3_COMMIT = "abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc"  # huggingface/diffusers, branch minimax-h3
 MINIMAX_H3_MODEL_ID = "MiniMaxAI/MiniMax-H3"
