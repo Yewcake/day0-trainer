@@ -118,6 +118,15 @@ def setup_environment() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_name_or_path", default=MINIMAX_H3_MODEL_ID)
+    # MiniMax-H3 ships two genuinely separate ~33B transformer checkpoints under one repo, confirmed
+    # via the actual model_index.json partition metadata, not assumed: "fl2va" (tasks t2va + fl2va --
+    # plain text-to-video and first/last-keyframe-conditioned generation) and "ref2va" (reference-image/
+    # video-conditioned generation, MiniMax-H3's native identity-consistency mechanism). Same
+    # architecture and config, different weights -- a LoRA trained against one partition's transformer
+    # is not a drop-in adapter for the other. Style/motion LoRAs (this script's target use case) belong
+    # on fl2va; a future identity/character LoRA, if ever needed despite Ref2VA's native reference
+    # conditioning, would target ref2va instead.
+    parser.add_argument("--partition", default="FL2VA", choices=["FL2VA", "Ref2VA"])
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--run_name", default="run")
@@ -224,7 +233,7 @@ def load_models(args):
     if args.quantize_base:
         quant_config = BitsAndBytesConfig(load_in_8bit=True)
     transformer = MiniMaxH3Transformer3DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="FL2VA/transformer",
+        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/transformer",
         torch_dtype=dtype, quantization_config=quant_config,
         # bitsandbytes quantized weights must be placed at load time via device_map -- moving them
         # with .to() afterwards does not work. Unquantized loads are moved explicitly below instead.
@@ -238,18 +247,20 @@ def load_models(args):
 
     say("Loading video VAE...")
     vae = AutoencoderKLMiniMaxH3.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="FL2VA/vae", torch_dtype=torch.float32,
+        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/video_vae", torch_dtype=torch.float32,
     ).to(device)
     vae.requires_grad_(False)
     vae.eval()
 
     say("Loading Qwen3-VL text conditioner (frozen, read at its 50th decoder layer, LM head unused)...")
     text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="FL2VA/text_encoder", torch_dtype=dtype,
+        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/text_encoder", torch_dtype=dtype,
     ).to(device)
     text_encoder.requires_grad_(False)
     text_encoder.eval()
-    tokenizer = Qwen2TokenizerFast.from_pretrained(args.pretrained_model_name_or_path, subfolder="FL2VA/tokenizer")
+    tokenizer = Qwen2TokenizerFast.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/tokenizer"
+    )
 
     video_scheduler = MiniMaxH3Scheduler(shift=args.video_shift)
     audio_scheduler = MiniMaxH3Scheduler(shift=args.audio_shift)
