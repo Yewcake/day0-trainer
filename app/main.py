@@ -464,7 +464,11 @@ def dataset_thumb(name: str, image: str, size: int = 220) -> FileResponse:
 
 @app.get("/api/datasets/{name}/video-meta/{video}", dependencies=[Depends(require_auth)])
 def video_meta(name: str, video: str) -> dict:
-    """Duration/dimensions for the trim tool's timeline + canvas-size preview."""
+    """Duration/dimensions for the trim tool's timeline + canvas-size preview.
+
+    The per-stream `duration` field ffprobe reports is frequently missing or wrong (many mp4/webm/mkv
+    muxings just don't tag it on the video stream itself) -- the container-level `format.duration` is
+    the reliable one, so that's read too and preferred whenever the stream value looks bogus."""
     source = dataset_dir(name) / safe_name(video)
     if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
         raise HTTPException(status_code=404, detail="Video not found.")
@@ -473,22 +477,55 @@ def video_meta(name: str, video: str) -> dict:
         raise HTTPException(status_code=500, detail="ffprobe is required but was not found.")
     result = subprocess.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height,duration", "-of", "json", str(source)],
+         "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", str(source)],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail="Could not read video metadata.")
-    stream = json.loads(result.stdout).get("streams", [{}])[0]
+    info = json.loads(result.stdout)
+    stream = info.get("streams", [{}])[0]
+    stream_duration = float(stream.get("duration") or 0)
+    format_duration = float(info.get("format", {}).get("duration") or 0)
+    # Prefer the container-level duration whenever the stream-level one is missing or clearly wrong
+    # (e.g. reporting a fraction of a second for a file that's actually much longer).
+    duration = format_duration if format_duration > stream_duration else stream_duration
     return {
         "width": int(stream.get("width", 0)), "height": int(stream.get("height", 0)),
-        "duration": float(stream.get("duration", 0)),
+        "duration": duration,
     }
+
+
+def _ffmpeg_cut(ffmpeg: str, source: Path, start: float, end: float, dest: Path) -> None:
+    # -ss after -i (input seeking) is frame-accurate, unlike the fast-but-keyframe-snapped
+    # -ss-before-i form -- worth the slower re-encode for a short curation clip.
+    result = subprocess.run(
+        [ffmpeg, "-y", "-i", str(source), "-ss", str(start), "-to", str(end),
+         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", str(dest)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Trim failed: {result.stderr[-300:]}")
+
+
+def _clear_thumb_cache(target: Path, filename: str) -> None:
+    thumb_dir = target / ".thumbs"
+    if thumb_dir.is_dir():
+        for stale in thumb_dir.glob(f"*_{filename}.jpg"):
+            stale.unlink(missing_ok=True)
 
 
 @app.post("/api/datasets/{name}/trim/{video}", dependencies=[Depends(require_auth)])
 def trim_video(name: str, video: str, payload: dict) -> dict:
-    """Cut a dataset video down to [start, end] seconds in place -- for shaping a raw clip into
-    the in/out range actually worth training on before it ever reaches the trainer."""
+    """Cut a dataset video down to [start, end] seconds -- for shaping a raw clip into the in/out
+    range actually worth training on before it ever reaches the trainer.
+
+    With chunk_seconds set, the selected range is instead split into consecutive same-length
+    pieces (e.g. a 9s selection at chunk_seconds=3 becomes three 3s clips) -- one longer take
+    turned into several independent training examples instead of one, each still short enough to
+    land in the clip-length range that actually teaches a single motion well. The original file
+    becomes the first chunk in place; later chunks are added as new dataset items sharing its
+    caption as a starting point (edit each afterward -- the same caption rarely fits every chunk
+    exactly)."""
     target = dataset_dir(name)
     source = target / safe_name(video)
     if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
@@ -497,30 +534,55 @@ def trim_video(name: str, video: str, payload: dict) -> dict:
     end = float(payload.get("end", 0))
     if start < 0 or end <= start:
         raise HTTPException(status_code=400, detail="Invalid trim range.")
+    chunk_seconds = float(payload.get("chunk_seconds") or 0)
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise HTTPException(status_code=500, detail="ffmpeg is required but was not found.")
-    handle, tmp_path = tempfile.mkstemp(suffix=source.suffix)
-    os.close(handle)
-    tmp_out = Path(tmp_path)
+
+    if chunk_seconds <= 0 or chunk_seconds >= (end - start):
+        handle, tmp_path = tempfile.mkstemp(suffix=source.suffix)
+        os.close(handle)
+        tmp_out = Path(tmp_path)
+        try:
+            _ffmpeg_cut(ffmpeg, source, start, end, tmp_out)
+            shutil.move(str(tmp_out), source)
+        finally:
+            tmp_out.unlink(missing_ok=True)
+        _clear_thumb_cache(target, source.name)
+        return {"ok": True, "clips_created": 1}
+
+    n_chunks = max(1, int((end - start) // chunk_seconds))
+    caption_file = source.with_suffix(".txt")
+    caption_text = caption_file.read_text(encoding="utf-8") if caption_file.exists() else ""
+    stem = source.stem
+
+    # Cut every chunk from the original file first, into temp files -- only once all of them exist
+    # is `source` itself overwritten. Cutting chunk 0 in place before cutting chunk 1 would mean
+    # chunk 1 gets cut from the already-truncated chunk-0 output instead of the original footage.
+    tmp_paths = []
     try:
-        # -ss after -i (input seeking) is frame-accurate, unlike the fast-but-keyframe-snapped
-        # -ss-before-i form -- worth the slower re-encode for a short curation clip.
-        result = subprocess.run(
-            [ffmpeg, "-y", "-i", str(source), "-ss", str(start), "-to", str(end),
-             "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", str(tmp_out)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Trim failed: {result.stderr[-300:]}")
-        shutil.move(str(tmp_out), source)
+        for i in range(n_chunks):
+            chunk_start = start + i * chunk_seconds
+            chunk_end = chunk_start + chunk_seconds
+            handle, tmp_path = tempfile.mkstemp(suffix=source.suffix)
+            os.close(handle)
+            _ffmpeg_cut(ffmpeg, source, chunk_start, chunk_end, Path(tmp_path))
+            tmp_paths.append(Path(tmp_path))
+
+        created = []
+        shutil.move(str(tmp_paths[0]), source)
+        _clear_thumb_cache(target, source.name)
+        created.append(source.name)
+        for i, tmp_path in enumerate(tmp_paths[1:], start=2):
+            dest = target / f"{stem}_part{i}{source.suffix}"
+            shutil.move(str(tmp_path), dest)
+            if caption_text:
+                dest.with_suffix(".txt").write_text(caption_text, encoding="utf-8")
+            created.append(dest.name)
     finally:
-        tmp_out.unlink(missing_ok=True)
-    thumb_dir = target / ".thumbs"
-    if thumb_dir.is_dir():
-        for stale in thumb_dir.glob(f"*_{source.name}.jpg"):
-            stale.unlink(missing_ok=True)
-    return {"ok": True}
+        for tmp_path in tmp_paths:
+            tmp_path.unlink(missing_ok=True)  # no-op for any already moved into place
+    return {"ok": True, "clips_created": len(created), "clips": created}
 
 
 @app.put("/api/datasets/{name}/caption/{image}", dependencies=[Depends(require_auth)])
