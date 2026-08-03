@@ -1,6 +1,21 @@
-# Day0 Trainer — Made by Yewcake
+# Day0 Trainer — Krea 2 / Ideogram 4 / MiniMax H3 LoRA Trainer, by Yewcake
 
-Universal direct Diffusers + PEFT trainer with a web UI. Ships with Krea 2 (Raw/Turbo, LoRA + LoKr); new models plug in via `models.json` + a trainer adapter. Runs as a RunPod template.
+Universal direct Diffusers + PEFT trainer with a web UI. New models plug in via `models.json` + a trainer adapter. Runs as a RunPod template.
+
+<p align="center">
+  <img src="docs/images/sample-1.jpg" alt="Day0 Trainer sample output 1" width="45%">
+  <img src="docs/images/sample-2.jpg" alt="Day0 Trainer sample output 2" width="45%">
+</p>
+
+## Supported models
+
+| Model | Networks | Status |
+|---|---|---|
+| Krea 2 (Raw) | LoRA, LoKr | Stable |
+| Krea 2 (Turbo) | LoRA, LoKr | Stable |
+| Ideogram 4 | LoRA | Stable |
+| MiniMax H3 (video) | LoRA | Experimental |
+| Z-Image Turbo | LoRA, LoKr | Coming soon |
 
 ## Features
 
@@ -50,7 +65,10 @@ Dockerfile                  environment image (rebuild rarely)
 docker/start.sh             pod boot: git pull code, launch UI
 app/main.py                 FastAPI backend (jobs, metrics, samples, downloads)
 app/static/index.html       web UI (loss chart, sample gallery, checkpoints)
-trainer/train_krea2_lora_direct.py   the actual trainer (LoRA + LoKr)
+models.json                 model registry (label, arch, trainer script, network types)
+trainer/train_krea2_lora_direct.py   Krea 2 trainer (LoRA + LoKr)
+trainer/train_ideogram4.py           Ideogram 4 trainer (LoRA, diffusion-pipe)
+trainer/train_minimax_h3.py          MiniMax H3 trainer (LoRA, video, experimental)
 ```
 
 ## Job output
