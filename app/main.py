@@ -424,6 +424,15 @@ def dataset_items(name: str) -> list[dict]:
     return out
 
 
+@app.get("/api/datasets/{name}/raw/{video}", dependencies=[Depends(require_auth)])
+def dataset_raw(name: str, video: str) -> FileResponse:
+    """Serves the actual video file (not a thumbnail) for the trim tool's <video> player."""
+    source = dataset_dir(name) / safe_name(video)
+    if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(status_code=404, detail="Video not found.")
+    return FileResponse(source)
+
+
 @app.get("/api/datasets/{name}/thumb/{image}", dependencies=[Depends(require_auth)])
 def dataset_thumb(name: str, image: str, size: int = 220) -> FileResponse:
     source = dataset_dir(name) / safe_name(image)
@@ -451,6 +460,67 @@ def dataset_thumb(name: str, image: str, size: int = 220) -> FileResponse:
         img.thumbnail((size, size))
         img.save(thumb, format="JPEG", quality=85)
     return FileResponse(thumb)
+
+
+@app.get("/api/datasets/{name}/video-meta/{video}", dependencies=[Depends(require_auth)])
+def video_meta(name: str, video: str) -> dict:
+    """Duration/dimensions for the trim tool's timeline + canvas-size preview."""
+    source = dataset_dir(name) / safe_name(video)
+    if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(status_code=404, detail="Video not found.")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise HTTPException(status_code=500, detail="ffprobe is required but was not found.")
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,duration", "-of", "json", str(source)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail="Could not read video metadata.")
+    stream = json.loads(result.stdout).get("streams", [{}])[0]
+    return {
+        "width": int(stream.get("width", 0)), "height": int(stream.get("height", 0)),
+        "duration": float(stream.get("duration", 0)),
+    }
+
+
+@app.post("/api/datasets/{name}/trim/{video}", dependencies=[Depends(require_auth)])
+def trim_video(name: str, video: str, payload: dict) -> dict:
+    """Cut a dataset video down to [start, end] seconds in place -- for shaping a raw clip into
+    the in/out range actually worth training on before it ever reaches the trainer."""
+    target = dataset_dir(name)
+    source = target / safe_name(video)
+    if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(status_code=404, detail="Video not found.")
+    start = float(payload.get("start", 0))
+    end = float(payload.get("end", 0))
+    if start < 0 or end <= start:
+        raise HTTPException(status_code=400, detail="Invalid trim range.")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail="ffmpeg is required but was not found.")
+    handle, tmp_path = tempfile.mkstemp(suffix=source.suffix)
+    os.close(handle)
+    tmp_out = Path(tmp_path)
+    try:
+        # -ss after -i (input seeking) is frame-accurate, unlike the fast-but-keyframe-snapped
+        # -ss-before-i form -- worth the slower re-encode for a short curation clip.
+        result = subprocess.run(
+            [ffmpeg, "-y", "-i", str(source), "-ss", str(start), "-to", str(end),
+             "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", str(tmp_out)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Trim failed: {result.stderr[-300:]}")
+        shutil.move(str(tmp_out), source)
+    finally:
+        tmp_out.unlink(missing_ok=True)
+    thumb_dir = target / ".thumbs"
+    if thumb_dir.is_dir():
+        for stale in thumb_dir.glob(f"*_{source.name}.jpg"):
+            stale.unlink(missing_ok=True)
+    return {"ok": True}
 
 
 @app.put("/api/datasets/{name}/caption/{image}", dependencies=[Depends(require_auth)])

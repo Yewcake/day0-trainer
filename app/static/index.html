@@ -83,6 +83,10 @@
   .dsitem img{width:100%;height:170px;object-fit:cover;display:block}
   .dsitem textarea{border:none;border-top:1px solid var(--line);border-radius:0;min-height:74px;font-size:11.5px;background:var(--panel)}
   .dsitem .selchk{position:absolute;top:8px;left:8px;width:20px;height:20px;z-index:2;cursor:pointer;accent-color:var(--accent)}
+  .trim-timeline{position:relative;height:40px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;margin-top:10px;user-select:none}
+  .trim-range{position:absolute;top:0;bottom:0;background:var(--accent);opacity:.3;pointer-events:none}
+  .trim-handle{position:absolute;top:-3px;width:14px;height:46px;margin-left:-7px;background:var(--accent-strong);border-radius:4px;cursor:ew-resize;z-index:2}
+  .trim-handle::after{content:'';position:absolute;left:50%;top:50%;width:2px;height:16px;background:var(--on-accent);transform:translate(-50%,-50%)}
   .enh-panel{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:14px;margin-bottom:16px;display:none}
   .enh-panel textarea{width:100%;min-height:60px;margin-bottom:8px}
   .enh-row-wrap{border-top:1px solid var(--line);padding:10px 0}
@@ -734,7 +738,8 @@ async function renderItems(name){
         onblur="saveCaption('${name}',this)">${escHtml(it.caption)}</textarea>
       <div class="hint" style="padding:0 8px">${dims}</div>
       <div style="padding:6px 8px 8px;display:flex;gap:6px">
-        ${it.is_video ? '' : `<button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button>`}
+        ${it.is_video ? `<button type="button" class="small" onclick="openTrim('${name}','${escHtml(it.image)}')">✂ Trim</button>`
+                      : `<button type="button" class="small" onclick="openEnhance('${name}','${escHtml(it.image)}')">✦ Enhance</button>`}
         <button type="button" class="small danger" onclick="deleteImage('${name}','${escHtml(it.image)}')">🗑</button>
       </div></div>`;
   }).join('') || '<div class="empty">No media.</div>';
@@ -748,6 +753,124 @@ async function deleteImage(name, image){
     toast('Image deleted.');
     renderItems(name);
   }catch(e){ toast(e.message); }
+}
+
+/* ---------------- video trim tool ---------------- */
+// MiniMax-H3's canvas-sizing formula, reimplemented client-side from the actual
+// diffusers source (modular_pipelines/minimax_h3/packing.py's resolve_canvas_size) --
+// short edge 768, area capped at 768*1344, both axes rounded to a multiple of 32,
+// aspect ratio clamped to [1:4, 4:1]. Used only to show a preview of the output
+// resolution; the real crop/resize happens in the trainer itself.
+function h3CanvasSize(aspectWidth, aspectHeight){
+  const SHORT_EDGE = 768, MAX_PIXELS = 768*1344, MULTIPLE = 32;
+  const ratio = aspectWidth / aspectHeight;
+  if (ratio < 0.25 || ratio > 4) return null;
+  let width, height;
+  if (ratio >= 1){ width = SHORT_EDGE*ratio; height = SHORT_EDGE; }
+  else { width = SHORT_EDGE; height = SHORT_EDGE/ratio; }
+  const area = width*height;
+  if (area > MAX_PIXELS){ const scale = Math.sqrt(MAX_PIXELS/area); width *= scale; height *= scale; }
+  const round32 = v => Math.max(MULTIPLE, Math.round(v/MULTIPLE)*MULTIPLE);
+  return {height: round32(height), width: round32(width)};
+}
+
+// Nearest valid MiniMax-H3 clip length: frame counts must be exactly 17n+5 at 24fps.
+function nearestValidFrames(frames){
+  const n = Math.round((frames - 5) / 17);
+  return Math.max(5, 17*Math.max(0,n) + 5);
+}
+
+let _trimState = null;
+
+async function openTrim(name, video){
+  let meta;
+  try{ meta = await api(`/api/datasets/${encodeURIComponent(name)}/video-meta/${encodeURIComponent(video)}`); }
+  catch(e){ toast('Could not read video metadata: '+e.message); return; }
+  const backdrop = $('#modalBackdrop'), box = $('#modalBox');
+  const canvas = meta.width && meta.height ? h3CanvasSize(meta.width, meta.height) : null;
+  _trimState = {name, video, duration: meta.duration || 0, start: 0, end: meta.duration || 0};
+  box.style.maxWidth = '640px';
+  box.innerHTML = `<div class="modal-title">Trim clip — ${escHtml(video)}</div>
+    <video id="trimVideo" src="/api/datasets/${encodeURIComponent(name)}/raw/${encodeURIComponent(video)}?t=${encodeURIComponent(TOKEN)}"
+      style="width:100%;max-height:44vh;background:#000;border-radius:6px" controls></video>
+    <div class="trim-timeline" id="trimTimeline">
+      <div class="trim-range" id="trimRange"></div>
+      <div class="trim-handle" id="trimHandleStart" style="left:0%"></div>
+      <div class="trim-handle" id="trimHandleEnd" style="left:100%"></div>
+    </div>
+    <div class="hint" id="trimInfo" style="display:block;margin-top:8px"></div>
+    <div class="hint" style="display:block;margin-top:2px">
+      Source ${meta.width||'?'}×${meta.height||'?'}${canvas ? ` → trainer output ~${canvas.width}×${canvas.height} (aspect preserved, only minor multiple-of-32 rounding)` : ' — aspect ratio outside MiniMax-H3\'s supported 1:4–4:1 range'}
+    </div>
+    <div class="modal-actions">
+      <button type="button" id="modalCancel">Cancel</button>
+      <button type="button" class="primary" id="trimApply">Apply trim</button>
+    </div>`;
+  backdrop.style.display = 'flex';
+  updateTrimInfo();
+  const closeTrim = () => { backdrop.style.display = 'none'; box.style.maxWidth = ''; _trimState = null; };
+  $('#modalCancel').onclick = closeTrim;
+  $('#trimApply').onclick = () => applyTrim(closeTrim);
+
+  const timeline = $('#trimTimeline');
+  const startDrag = (handleId, key) => {
+    const handle = $('#'+handleId);
+    handle.addEventListener('mousedown', ev => {
+      ev.preventDefault();
+      const move = moveEv => {
+        const rect = timeline.getBoundingClientRect();
+        let pct = (moveEv.clientX - rect.left) / rect.width;
+        pct = Math.max(0, Math.min(1, pct));
+        const time = pct * _trimState.duration;
+        if (key === 'start') _trimState.start = Math.min(time, _trimState.end - 0.05);
+        else _trimState.end = Math.max(time, _trimState.start + 0.05);
+        updateTrimInfo();
+      };
+      const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  };
+  startDrag('trimHandleStart', 'start');
+  startDrag('trimHandleEnd', 'end');
+}
+
+function updateTrimInfo(){
+  if (!_trimState) return;
+  const {duration, start, end} = _trimState;
+  const startPct = duration ? (start/duration*100) : 0;
+  const endPct = duration ? (end/duration*100) : 100;
+  const startHandle = $('#trimHandleStart'), endHandle = $('#trimHandleEnd'), range = $('#trimRange');
+  if (startHandle) startHandle.style.left = startPct+'%';
+  if (endHandle) endHandle.style.left = endPct+'%';
+  if (range){ range.style.left = startPct+'%'; range.style.width = (endPct-startPct)+'%'; }
+  const video = $('#trimVideo');
+  if (video && Math.abs(video.currentTime - start) > 0.5) video.currentTime = start;
+  const selDuration = Math.max(0, end - start);
+  const frames = Math.round(selDuration * 24);
+  const nearest = nearestValidFrames(frames);
+  const info = $('#trimInfo');
+  if (info){
+    info.textContent = `${start.toFixed(1)}s → ${end.toFixed(1)}s (${selDuration.toFixed(1)}s, ~${frames} frames @ 24fps — ` +
+      `trainer will use the nearest valid length, ${nearest} frames)`;
+  }
+}
+
+async function applyTrim(onDone){
+  if (!_trimState) return;
+  const {name, video, start, end} = _trimState;
+  if (end - start < 0.2){ toast('Selected range is too short.'); return; }
+  const btn = $('#trimApply');
+  btn.disabled = true; btn.textContent = 'Trimming…';
+  try{
+    await post(`/api/datasets/${encodeURIComponent(name)}/trim/${encodeURIComponent(video)}`, {start, end});
+    toast('Clip trimmed.');
+    onDone();
+    renderItems(name);
+  }catch(e){
+    toast('Trim failed: '+e.message);
+    btn.disabled = false; btn.textContent = 'Apply trim';
+  }
 }
 
 function updateSelCount(){
