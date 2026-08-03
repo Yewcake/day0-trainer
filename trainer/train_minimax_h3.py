@@ -629,12 +629,29 @@ def main() -> None:
             ckpt_dir = checkpoints_dir / f"step-{global_step:06d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             lora_state_dict = get_peft_model_state_dict(transformer, adapter_name="default")
+            # Filename matches the cross-trainer convention app/main.py's job_checkpoints()/
+            # download_checkpoint() already hardcode (Ideogram4's trainer follows the same
+            # convention for the same reason) -- not because H3 is Krea2, just so the existing
+            # checkpoint-listing/download UI works unmodified for every trainer.
             safetensors.torch.save_file(
-                lora_state_dict, str(ckpt_dir / "pytorch_lora_weights.safetensors"), metadata={"format": "pt"}
+                lora_state_dict, str(ckpt_dir / "krea2_comfy_native_lora.safetensors"), metadata={"format": "pt"}
             )
             say(f"Saved checkpoint: {ckpt_dir}")
 
     say("Training complete.")
+
+    # A prior live run finished all 50 steps and saved both checkpoints cleanly
+    # (this exact log line was its last output, no traceback anywhere) yet the
+    # process still exited non-zero, marking the job "failed" in the app. That
+    # points at a crash during normal interpreter shutdown -- e.g. CUDA context
+    # teardown racing with bitsandbytes' quantized tensors, a known class of
+    # issue with large quantized models on process exit -- not a training bug.
+    # os._exit() skips atexit handlers/__del__/GC entirely and terminates
+    # immediately with status 0, sidestepping that teardown rather than trying
+    # to debug a shutdown-order issue inside two libraries we don't control.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
