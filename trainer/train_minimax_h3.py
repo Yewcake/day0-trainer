@@ -329,7 +329,31 @@ def load_transformer(args, device):
     # live at the top-level "transformer" (FL2VA) / "transformer_ref" (Ref2VA) folders -- confirmed
     # by reading both config.json files, not assumed.
     partition_subfolder = {"FL2VA": "transformer", "Ref2VA": "transformer_ref"}[args.partition]
-    quant_config = BitsAndBytesConfig(load_in_8bit=True) if args.quantize_base else None
+    # Live run got all the way into the first real forward pass and crashed there:
+    # NotImplementedError: "addmm_cuda" not implemented for 'Char'. Root cause: several small
+    # "boundary" Linears (proj_in, audio_proj_in, context_embedder, time_embedder, proj_out,
+    # audio_proj_out, every block's adaln_proj, norm_out) have their forward calls written as
+    # `self.linear(x.to(self.linear.weight.dtype))` -- reading the *quantized layer's own weight
+    # dtype* to decide what to cast the activation to. That's fine when weight.dtype is a normal
+    # float dtype, but under int8 quantization it isn't a valid cast target for an activation
+    # tensor at all. diffusers already flags proj_in/audio_proj_in/time_embedder/proj_out/
+    # audio_proj_out as _keep_in_fp32_modules for exactly this reason -- context_embedder,
+    # adaln_proj (all 50 of them) and norm_out do the identical pattern but were missed from that
+    # list, so they'd hit this same crash the moment training reached them. None of these are
+    # LoRA targets anyway (only transformer_blocks.*.attn.*/.ff.* are) -- but adaln_proj is NOT
+    # a small exclusion: each block's is a (2688 -> 6*5376*3) linear, ~260M params, and there are
+    # 50 of them -- ~13B params, ~40% of the model's 33B total, staying in bf16 (2 bytes) instead
+    # of int8. That's a real, meaningful jump in static memory (roughly 46GB total transformer
+    # weights instead of ~33GB fully quantized), not a rounding error -- still fits an 80GB GPU
+    # with LoRA/activation headroom to spare, just not as comfortably as the fully-quantized
+    # estimate suggested. Worth knowing if VRAM ever gets tight on a smaller card.
+    quant_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_skip_modules=[
+            "proj_in", "audio_proj_in", "context_embedder", "time_embedder",
+            "proj_out", "audio_proj_out", "adaln_proj", "norm_out", "rope",
+        ],
+    ) if args.quantize_base else None
     transformer = MiniMaxH3Transformer3DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder=partition_subfolder,
         torch_dtype=dtype, quantization_config=quant_config,
