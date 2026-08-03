@@ -259,8 +259,16 @@ def load_encoders(args, device):
     dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
 
     say("Loading video VAE...")
+    # NOT {partition}/video_vae -- that subfolder is MiniMax's own native "standalone" bundle
+    # (raw Python source + a model.safetensors under a nested source/ dir, config._class_name
+    # "MiniMaxH3VideoVAE" with auto_map pointing at their own AutoencoderKLLegacy code), a
+    # completely different thing from the diffusers-native checkpoint our AutoencoderKLMiniMaxH3
+    # class expects. The real diffusers-format one (config._class_name "AutoencoderKLMiniMaxH3",
+    # proper sharded diffusion_pytorch_model-*.safetensors) lives at the shared top-level "vae"
+    # folder -- confirmed by reading both config.json files, not assumed. Same VAE either
+    # partition, so this isn't partition-specific.
     vae = AutoencoderKLMiniMaxH3.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/video_vae", torch_dtype=torch.float32,
+        args.pretrained_model_name_or_path, subfolder="vae", torch_dtype=torch.float32,
     ).to(device)
     vae.requires_grad_(False)
     vae.eval()
@@ -299,9 +307,16 @@ def load_transformer(args, device):
     dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
 
     say("Loading MiniMax-H3 transformer (33B, LoRA training only -- do not attempt full fine-tune)...")
+    # NOT {partition}/transformer -- that subfolder's config._class_name is "MiniMaxH3DiTModel",
+    # MiniMax's own native checkpoint (13 shards named model-*.safetensors), not the diffusers-native
+    # MiniMaxH3Transformer3DModel our import expects. The real diffusers-format checkpoints (config.
+    # _class_name "MiniMaxH3Transformer3DModel", proper diffusion_pytorch_model-*.safetensors shards)
+    # live at the top-level "transformer" (FL2VA) / "transformer_ref" (Ref2VA) folders -- confirmed
+    # by reading both config.json files, not assumed.
+    partition_subfolder = {"FL2VA": "transformer", "Ref2VA": "transformer_ref"}[args.partition]
     quant_config = BitsAndBytesConfig(load_in_8bit=True) if args.quantize_base else None
     transformer = MiniMaxH3Transformer3DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder=f"{args.partition}/transformer",
+        args.pretrained_model_name_or_path, subfolder=partition_subfolder,
         torch_dtype=dtype, quantization_config=quant_config,
         # bitsandbytes quantized weights must be placed at load time via device_map -- moving them
         # with .to() afterwards does not work. Unquantized loads are moved explicitly below instead.
