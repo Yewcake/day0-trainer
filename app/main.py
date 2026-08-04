@@ -227,19 +227,53 @@ VIDEO_MIME_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "vid
 GEMINI_INLINE_LIMIT_BYTES = 19 * 1024 * 1024  # Gemini's inline-request cap is ~20MB total; leave headroom for the prompt text.
 
 
+def _compress_video_for_gemini(path: Path) -> Path:
+    """Gemini only needs to see the motion clearly enough to caption/locate it, not the quality the
+    trainer will actually use (which downscales to its own ~768px working resolution regardless of
+    source anyway) -- so a large source clip gets a throwaway compressed copy instead of being
+    rejected outright. The real dataset file on disk is never touched."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to compress this video for Gemini but was not found.")
+    handle, tmp_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(handle)
+    dest = Path(tmp_path)
+    result = subprocess.run(
+        [ffmpeg, "-y", "-i", str(path),
+         "-vf", "scale='min(480,iw)':'min(480,ih)':force_original_aspect_ratio=decrease",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-an", str(dest)],
+        capture_output=True, text=True, timeout=180,
+    )
+    if result.returncode != 0 or not dest.is_file():
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"Could not compress {path.name} for Gemini: {result.stderr[-300:]}")
+    if dest.stat().st_size > GEMINI_INLINE_LIMIT_BYTES:
+        size_mb = dest.stat().st_size / 1e6
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"{path.name} is still {size_mb:.1f}MB after compression (~20MB Gemini limit). "
+            "Trim it shorter with the ✂ Trim tool first."
+        )
+    return dest
+
+
 def encode_video_for_gemini(path: Path) -> dict:
     """Gemini reads actual video content natively (motion across frames, not just one still), which
     is the whole point for video training clips -- but only inline for files under its ~20MB request
-    cap. Our trim tool keeps clips to a few seconds specifically so they land well under that."""
+    cap. Files under the cap go through as-is; larger ones get compressed first (see
+    _compress_video_for_gemini)."""
     size = path.stat().st_size
-    if size > GEMINI_INLINE_LIMIT_BYTES:
-        raise RuntimeError(
-            f"{path.name} is {size / 1e6:.1f}MB, too large to send to Gemini inline (~20MB limit). "
-            "Trim it shorter with the ✂ Trim tool first."
-        )
-    mime_type = VIDEO_MIME_TYPES.get(path.suffix.lower(), "video/mp4")
-    data = base64.b64encode(path.read_bytes()).decode()
-    return {"inline_data": {"mime_type": mime_type, "data": data}}
+    if size <= GEMINI_INLINE_LIMIT_BYTES:
+        mime_type = VIDEO_MIME_TYPES.get(path.suffix.lower(), "video/mp4")
+        data = base64.b64encode(path.read_bytes()).decode()
+        return {"inline_data": {"mime_type": mime_type, "data": data}}
+
+    compressed = _compress_video_for_gemini(path)
+    try:
+        data = base64.b64encode(compressed.read_bytes()).decode()
+        return {"inline_data": {"mime_type": "video/mp4", "data": data}}
+    finally:
+        compressed.unlink(missing_ok=True)
 
 
 def gemini_generate(model: str, parts: list[dict], key: str, timeout: int = 120) -> str:
