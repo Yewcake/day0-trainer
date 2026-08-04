@@ -117,8 +117,9 @@ def dataset_videos(path: Path) -> list[Path]:
 
 def dataset_media(path: Path) -> list[Path]:
     """Images and videos together, e.g. for listing/export -- most other call sites want just one
-    or the other (the Gemini captioner and enhance panel are image-only; MiniMax-H3 training data
-    is video-only), so this is only for the places that genuinely need both."""
+    or the other (the Gemini captioner runs per caption method -- image or video -- against just
+    that subset; the enhance panel is image-only; MiniMax-H3 training data is video-only), so this
+    is only for the places that genuinely need both."""
     return sorted(dataset_images(path) + dataset_videos(path), key=lambda p: p.name)
 
 
@@ -693,12 +694,15 @@ SMART_CLIP_INSTRUCTION_TEMPLATE = (
     "You are curating a video LoRA training dataset. Watch this clip and identify up to 3 short "
     "segments where clear physical motion/action happens (not static shots, pans, or dead time). "
     "Each segment should be a single continuous moment, roughly {clip_seconds} seconds long, that "
-    "on its own teaches the motion well. For each segment also write a caption in the same style as "
-    "dataset captions: concise, natural, positive phrasing describing what physically happens over "
-    "that segment. Respond with ONLY a JSON array, no markdown fences, no other text, in this exact "
-    "shape: [{{\"start\": <seconds float>, \"end\": <seconds float>, \"caption\": \"<text>\"}}, ...]. "
-    "If there isn't enough distinct motion for multiple segments, return fewer entries. Times must "
-    "fall within the clip's actual duration."
+    "on its own teaches the motion well. For each segment also write a dataset caption for it -- but "
+    "the model must learn the motion itself as an implicit concept, not tied to text, so the caption "
+    "must describe everything EXCEPT the motion: expression, outfit, pose or starting body position, "
+    "hairstyle, camera angle, jewelry, accessories, setting, background, in concise natural positive "
+    "phrasing, with no verbs of motion or action and no mention of what physically happens or "
+    "changes. Respond with ONLY a JSON array, no markdown fences, no other text, in this exact shape: "
+    "[{{\"start\": <seconds float>, \"end\": <seconds float>, \"caption\": \"<text>\"}}, ...]. If "
+    "there isn't enough distinct motion for multiple segments, return fewer entries. Times must fall "
+    "within the clip's actual duration."
 )
 
 
@@ -1081,7 +1085,7 @@ def enhance_gemini_pick(name: str, image: str) -> dict:
 # Captioner (Gemini, background batch)
 # --------------------------------------------------------------------------
 DEFAULT_CAPTION_INSTRUCTION = (
-    "You are a world-class AI model specialist for image and video generation. "
+    "You are a world-class AI model specialist for image generation. "
     "Caption the image for dataset creation. Mention only: expression, outfit, pose, "
     "hairstyle, camera angle, whether there is blur in the photo, jewelry, accessories, "
     "setting, background. Do not mention face shape or body type. Caption in concise "
@@ -1089,6 +1093,24 @@ DEFAULT_CAPTION_INSTRUCTION = (
     "visible, caption it. Caption only what you see, in natural positive phrasing only -- "
     "do not use words like 'no', 'or', 'not'. For example, 'face out of frame' is allowed, "
     "but 'no visible jewelry' is not allowed -- just don't mention things that aren't there."
+)
+
+# Deliberately the opposite of the image instruction's completeness: the whole point of a video
+# LoRA dataset is for the model to learn the motion itself as an implicit concept, not one tied to
+# a text description, so the caption must describe everything EXCEPT what's moving or changing.
+# Captioning the motion here would teach the model to only reproduce that motion when the exact
+# caption text is present, rather than baking it in as the dataset's constant, unlabeled trait.
+DEFAULT_VIDEO_CAPTION_INSTRUCTION = (
+    "You are a world-class AI model specialist for video generation LoRA datasets. This is a short "
+    "video clip. The model must learn the motion/action happening in it as an implicit concept, not "
+    "tied to any text description, so caption everything EXCEPT the motion. Mention only the static, "
+    "held-constant elements visible throughout the clip: expression, outfit, pose or starting body "
+    "position, hairstyle, camera angle, whether there is blur, jewelry, accessories, setting, "
+    "background. Do not mention face shape or body type. Do NOT describe what physically happens, "
+    "moves, or changes over the clip -- no verbs of motion or action at all. Caption in concise but "
+    "detailed natural language. Output only the caption, no preamble. If a tattoo is visible, caption "
+    "it. Caption only what you see, in natural positive phrasing only -- do not use words like 'no', "
+    "'or', 'not'."
 )
 
 
@@ -1116,19 +1138,12 @@ def wrap_ideogram4_caption(text: str, trigger: str) -> dict:
     }
 
 
-VIDEO_MOTION_HINT = (
-    " This is a short video clip, not a still image -- Gemini can see the actual motion across "
-    "its frames, so describe what physically happens over the clip (the movement, transition, or "
-    "action) in addition to the visual details above, in the same natural positive phrasing."
-)
-
-
 def _caption_worker(
-    name: str, instruction: str, model: str, trigger: str, only_missing: bool, key: str, caption_format: str
+    name: str, instruction: str, model: str, trigger: str, only_missing: bool, key: str, caption_format: str, method: str
 ) -> None:
     state = _caption_runs[name]
     target = dataset_dir(name)
-    items = dataset_media(target)
+    items = dataset_videos(target) if method == "video" else dataset_images(target)
     if only_missing:
         items = [item for item in items if not item.with_suffix(".txt").exists()]
     state.update({"total": len(items), "done": 0, "errors": [], "status": "running"})
@@ -1137,9 +1152,8 @@ def _caption_worker(
             state["status"] = "cancelled"
             return
         try:
-            is_video = item.suffix.lower() in VIDEO_EXTS
-            if is_video:
-                parts = [{"text": instruction + VIDEO_MOTION_HINT}, encode_video_for_gemini(item)]
+            if method == "video":
+                parts = [{"text": instruction}, encode_video_for_gemini(item)]
             else:
                 parts = [{"text": instruction}, encode_image_for_gemini(item)]
             caption = gemini_generate(model, parts, key).replace("\n", " ").strip()
@@ -1162,7 +1176,9 @@ def caption_all(name: str, payload: dict) -> dict:
         raise HTTPException(status_code=409, detail="Captioning already running for this dataset.")
     key = gemini_key()
     model = str(payload.get("model") or load_settings().get("gemini_model") or "gemini-2.5-flash")
-    instruction = str(payload.get("instruction") or DEFAULT_CAPTION_INSTRUCTION)
+    method = str(payload.get("method") or "image")
+    default_instruction = DEFAULT_VIDEO_CAPTION_INSTRUCTION if method == "video" else DEFAULT_CAPTION_INSTRUCTION
+    instruction = str(payload.get("instruction") or default_instruction)
     trigger = str(payload.get("trigger_word", "")).strip()
     only_missing = bool(payload.get("only_missing", True))
     caption_format = str(payload.get("caption_format") or "plain")
@@ -1170,7 +1186,7 @@ def caption_all(name: str, payload: dict) -> dict:
         (dataset_dir(name) / ".trigger").write_text(trigger, encoding="utf-8")
     _caption_runs[name] = {"status": "starting", "cancel": False}
     thread = threading.Thread(
-        target=_caption_worker, args=(name, instruction, model, trigger, only_missing, key, caption_format), daemon=True
+        target=_caption_worker, args=(name, instruction, model, trigger, only_missing, key, caption_format, method), daemon=True
     )
     thread.start()
     return {"started": True}
@@ -1189,8 +1205,8 @@ def caption_cancel(name: str) -> dict:
 
 
 @app.get("/api/caption-default-instruction", dependencies=[Depends(require_auth)])
-def caption_default() -> dict:
-    return {"instruction": DEFAULT_CAPTION_INSTRUCTION}
+def caption_default(method: str = "image") -> dict:
+    return {"instruction": DEFAULT_VIDEO_CAPTION_INSTRUCTION if method == "video" else DEFAULT_CAPTION_INSTRUCTION}
 
 
 # --------------------------------------------------------------------------

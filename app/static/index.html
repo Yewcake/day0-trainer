@@ -656,10 +656,16 @@ async function deleteDataset(name){
   toast('Dataset deleted.'); renderDatasetList(); $('#dsdetail').innerHTML='';
 }
 
+let _lastDefaultInstruction = '';
+
 async function openDataset(name){
   clearInterval(capTimer);
   clearInterval(enhanceTimer);
-  const def = await api('/api/caption-default-instruction');
+  let items = [];
+  try{ items = await api(`/api/datasets/${encodeURIComponent(name)}/items`); }catch(e){ /* fall back to image default */ }
+  const method = items.some(it => it.is_video) ? 'video' : 'image';
+  const def = await api(`/api/caption-default-instruction?method=${method}`);
+  _lastDefaultInstruction = def.instruction;
   $('#dsdetail').innerHTML = `
     <h3>Captioner — ${name}</h3>
     <div class="card">
@@ -667,6 +673,9 @@ async function openDataset(name){
         <div style="display:flex;gap:8px"><select id="cap_model" style="flex:1"><option value="">— load models —</option></select>
         <button type="button" class="small" onclick="loadGeminiModels()">↻ Fetch models</button></div></div>
       <div class="row"><label>Trigger word</label><input id="cap_trigger" placeholder="prefixed to every caption (optional)"></div>
+      <div class="row"><label>Caption method</label><select id="cap_method" onchange="onCapMethodChange('${name}')">
+        <option value="image" ${method==='image'?'selected':''}>Image</option>
+        <option value="video" ${method==='video'?'selected':''}>Video (excludes motion from caption)</option></select></div>
       <div class="row" style="align-items:start"><label style="padding-top:8px">Instruction</label>
         <textarea id="cap_instruction" style="min-height:110px">${def.instruction}</textarea></div>
       <div class="row"><label>Scope</label><select id="cap_scope">
@@ -1234,10 +1243,22 @@ async function refreshCaptionsLive(name, force){
   }
 }
 
+async function onCapMethodChange(name){
+  const method = $('#cap_method')?.value;
+  let def;
+  try{ def = await api(`/api/caption-default-instruction?method=${method}`); }catch(e){ toast(e.message); return; }
+  const box = $('#cap_instruction');
+  // Only swap the instruction text if it's still the previously-loaded default (i.e. unedited) --
+  // switching method shouldn't silently discard a custom instruction the user already wrote.
+  if (box && (!box.value.trim() || box.value === _lastDefaultInstruction)) box.value = def.instruction;
+  _lastDefaultInstruction = def.instruction;
+}
+
 async function captionAll(name){
   try{
     await post(`/api/datasets/${encodeURIComponent(name)}/caption-all`, {
       model: $('#cap_model').value, instruction: $('#cap_instruction').value,
+      method: $('#cap_method')?.value || 'image',
       trigger_word: $('#cap_trigger').value.trim(), only_missing: $('#cap_scope').value==='1',
       caption_format: $('#cap_format').value,
     });
