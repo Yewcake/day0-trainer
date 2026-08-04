@@ -367,8 +367,9 @@ def load_transformer(args, device):
     # tensor at all. diffusers already flags proj_in/audio_proj_in/time_embedder/proj_out/
     # audio_proj_out as _keep_in_fp32_modules for exactly this reason -- context_embedder,
     # adaln_proj (all 50 of them) and norm_out do the identical pattern but were missed from that
-    # list, so they'd hit this same crash the moment training reached them. None of these are
-    # LoRA targets anyway (only transformer_blocks.*.attn.*/.ff.* are) -- but adaln_proj is NOT
+    # list, so they'd hit this same crash the moment training reached them. context_embedder and
+    # norm_out aren't LoRA targets (only transformer_blocks.*.attn.*/.ff.*/.adaln_proj.linear and
+    # token_refiner.refiner_blocks.*.attn.*/.ff.* are, see inject_lora()) -- but adaln_proj is NOT
     # a small exclusion: each block's is a (2688 -> 6*5376*3) linear, ~260M params, and there are
     # 50 of them -- ~13B params, ~40% of the model's 33B total, staying in bf16 (2 bytes) instead
     # of int8. That's a real, meaningful jump in static memory (roughly 46GB total transformer
@@ -428,19 +429,35 @@ def inject_lora(transformer, rank: int, alpha: int):
     # module SwiGLU(...) is not supported"). Checking isinstance(nn.Linear) directly -- true for
     # bitsandbytes' Linear8bitLt and Linear4bit too, since both subclass nn.Linear -- avoids this
     # whole class of "guessed the wrong thing from a name" bug instead of just special-casing swiglu.
+    #
+    # Widened beyond just the main attention/FFN linears (confirmed by inspecting a real ai-toolkit
+    # checkpoint's key list directly, not guessed): also targets each block's adaln_proj.linear (the
+    # AdaLN modulation projection -- named "adaln_proj" in the actual checkpoint, "linear" is
+    # diffusers' name for its inner nn.Linear, per that class's own docstring) and the token_refiner's
+    # own small attention+FFN stack (a separate pre-encoder for the text stream, "No AdaLN and no
+    # rotary embedding" per its own docstring -- reuses the same Attention/FeedForward classes as the
+    # main blocks, so the same to_q/to_k/to_v/to_out.0/ff.net.0.proj/ff.net.2 suffixes apply, just
+    # under token_refiner.refiner_blocks.N instead of transformer_blocks.N).
+    attn_ff_suffixes = (".to_q", ".to_k", ".to_v", ".to_out.0", ".ff.net.0.proj", ".ff.net.2")
     target_modules = []
     for name, module in transformer.named_modules():
-        if not name.startswith("transformer_blocks.") or not isinstance(module, torch.nn.Linear):
+        if not isinstance(module, torch.nn.Linear):
             continue
-        if name.endswith((".to_q", ".to_k", ".to_v", ".to_out.0", ".ff.net.0.proj", ".ff.net.2")):
+        in_main_blocks = name.startswith("transformer_blocks.")
+        in_token_refiner = name.startswith("token_refiner.refiner_blocks.")
+        if not (in_main_blocks or in_token_refiner):
+            continue
+        suffixes = attn_ff_suffixes + (".adaln_proj.linear",) if in_main_blocks else attn_ff_suffixes
+        if name.endswith(suffixes):
             target_modules.append(name)
     if not target_modules:
         raise RuntimeError(
-            "No LoRA target modules resolved from transformer_blocks.* -- MiniMax-H3's module "
-            "naming may have changed since this script was written against diffusers commit "
+            "No LoRA target modules resolved from transformer_blocks.*/token_refiner.* -- MiniMax-H3's "
+            "module naming may have changed since this script was written against diffusers commit "
             f"{DIFFUSERS_MINIMAX_H3_COMMIT}."
         )
-    say(f"Injecting LoRA (rank={rank}, alpha={alpha}) into {len(target_modules)} linear layers across 50 blocks.")
+    say(f"Injecting LoRA (rank={rank}, alpha={alpha}) into {len(target_modules)} linear layers "
+        f"(transformer blocks + token refiner + adaln_proj).")
     lora_config = LoraConfig(r=rank, lora_alpha=alpha, target_modules=target_modules, init_lora_weights="gaussian")
     transformer.add_adapter(lora_config)
     return transformer
