@@ -682,6 +682,138 @@ def autoclip_videos(name: str, payload: dict) -> dict:
     return {"ok": True, "videos_processed": videos_processed, "clips_created": clips_created, "skipped": skipped}
 
 
+# --------------------------------------------------------------------------
+# Smart autoclip (Gemini-assisted): asks Gemini where the motion actually is
+# instead of slicing at fixed intervals, and captions each clip in the same
+# call -- reuses the video understanding already used for captioning.
+# --------------------------------------------------------------------------
+_smart_clip_runs: dict[str, dict] = {}
+
+SMART_CLIP_INSTRUCTION_TEMPLATE = (
+    "You are curating a video LoRA training dataset. Watch this clip and identify up to 3 short "
+    "segments where clear physical motion/action happens (not static shots, pans, or dead time). "
+    "Each segment should be a single continuous moment, roughly {clip_seconds} seconds long, that "
+    "on its own teaches the motion well. For each segment also write a caption in the same style as "
+    "dataset captions: concise, natural, positive phrasing describing what physically happens over "
+    "that segment. Respond with ONLY a JSON array, no markdown fences, no other text, in this exact "
+    "shape: [{{\"start\": <seconds float>, \"end\": <seconds float>, \"caption\": \"<text>\"}}, ...]. "
+    "If there isn't enough distinct motion for multiple segments, return fewer entries. Times must "
+    "fall within the clip's actual duration."
+)
+
+
+def _parse_gemini_json_array(text: str) -> list:
+    # Gemini sometimes wraps JSON in ```json ... ``` fences despite being told not to.
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text)
+
+
+def _write_smart_caption(path: Path, caption: str, trigger: str) -> None:
+    caption = (caption or "").strip()
+    if not caption:
+        return
+    if trigger and trigger not in caption:
+        caption = f"{trigger}, {caption}"
+    path.with_suffix(".txt").write_text(caption, encoding="utf-8")
+
+
+def _smart_clip_worker(name: str, videos: list[Path], clip_seconds: float, model: str, key: str, trigger: str) -> None:
+    state = _smart_clip_runs[name]
+    target = dataset_dir(name)
+    ffmpeg = shutil.which("ffmpeg")
+    state.update({"total": len(videos), "done": 0, "errors": [], "clips_created": 0, "status": "running"})
+    for source in videos:
+        if state.get("cancel"):
+            state["status"] = "cancelled"
+            return
+        try:
+            duration = _probe_video(source)["duration"]
+            parts = [
+                {"text": SMART_CLIP_INSTRUCTION_TEMPLATE.format(clip_seconds=clip_seconds)},
+                encode_video_for_gemini(source),
+            ]
+            raw = gemini_generate(model, parts, key, timeout=120)
+            segments = _parse_gemini_json_array(raw)[:3]
+            valid = [
+                s for s in segments
+                if isinstance(s, dict) and 0 <= float(s.get("start", -1)) < float(s.get("end", -1))
+                and float(s.get("start", -1)) < duration
+            ]
+            if not valid:
+                state["errors"].append(f"{source.name}: no valid motion segments returned")
+                state["done"] += 1
+                continue
+
+            stem = source.stem
+            tmp_paths = []
+            try:
+                for seg in valid:
+                    handle, tmp_path = tempfile.mkstemp(suffix=source.suffix)
+                    os.close(handle)
+                    _ffmpeg_cut(ffmpeg, source, float(seg["start"]), min(float(seg["end"]), duration), Path(tmp_path))
+                    tmp_paths.append(Path(tmp_path))
+
+                shutil.move(str(tmp_paths[0]), source)
+                _clear_thumb_cache(target, source.name)
+                _write_smart_caption(source, valid[0].get("caption", ""), trigger)
+                for i, tmp_path in enumerate(tmp_paths[1:], start=2):
+                    dest = target / f"{stem}_part{i}{source.suffix}"
+                    shutil.move(str(tmp_path), dest)
+                    _write_smart_caption(dest, valid[i - 1].get("caption", ""), trigger)
+            finally:
+                for tmp_path in tmp_paths:
+                    tmp_path.unlink(missing_ok=True)  # no-op for any already moved into place
+            state["clips_created"] += len(valid)
+        except Exception as exc:
+            state["errors"].append(f"{source.name}: {exc}")
+        state["done"] += 1
+    state["status"] = "finished"
+
+
+@app.post("/api/datasets/{name}/autoclip/smart", dependencies=[Depends(require_auth)])
+def autoclip_smart(name: str, payload: dict) -> dict:
+    """Gemini-assisted autoclip: instead of slicing every video at fixed intervals, ask Gemini
+    (already used for captioning, so this is one more use of the same call) to find up to 3 segments
+    per video where the actual motion happens, and caption each segment in the same pass. One Gemini
+    call per video does both clip selection and captioning."""
+    if _smart_clip_runs.get(name, {}).get("status") == "running":
+        raise HTTPException(status_code=409, detail="Smart autoclip already running for this dataset.")
+    target = dataset_dir(name)
+    clip_seconds = float(payload.get("clip_seconds") or 3)
+    key = gemini_key()
+    model = str(payload.get("model") or load_settings().get("gemini_model") or "gemini-2.5-flash")
+    trigger = str(payload.get("trigger_word", "")).strip()
+    requested = payload.get("videos")
+    videos = [target / safe_name(v) for v in requested] if requested else dataset_videos(target)
+    videos = [v for v in videos if v.is_file() and v.suffix.lower() in VIDEO_EXTS]
+    if not videos:
+        raise HTTPException(status_code=400, detail="No videos to process.")
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(status_code=500, detail="ffmpeg is required but was not found.")
+    _smart_clip_runs[name] = {"status": "starting", "cancel": False}
+    thread = threading.Thread(
+        target=_smart_clip_worker, args=(name, videos, clip_seconds, model, key, trigger), daemon=True
+    )
+    thread.start()
+    return {"started": True}
+
+
+@app.get("/api/datasets/{name}/autoclip/smart-status", dependencies=[Depends(require_auth)])
+def autoclip_smart_status(name: str) -> dict:
+    return _smart_clip_runs.get(name, {"status": "idle"})
+
+
+@app.post("/api/datasets/{name}/autoclip/smart-cancel", dependencies=[Depends(require_auth)])
+def autoclip_smart_cancel(name: str) -> dict:
+    if name in _smart_clip_runs:
+        _smart_clip_runs[name]["cancel"] = True
+    return {"ok": True}
+
+
 @app.put("/api/datasets/{name}/caption/{image}", dependencies=[Depends(require_auth)])
 def set_caption(name: str, image: str, payload: dict) -> dict:
     source = dataset_dir(name) / safe_name(image)

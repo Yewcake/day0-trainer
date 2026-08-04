@@ -686,6 +686,8 @@ async function openDataset(name){
       <button type="button" onclick="enhanceSelected('${name}')">✦ Enhance selected</button>
       <input id="autoclipSeconds" type="number" min="0.5" step="0.5" value="3" style="max-width:64px" title="Clip length in seconds">
       <button type="button" onclick="autoclipVideos('${name}')">✂ Autoclip videos</button>
+      <button type="button" onclick="autoclipSmart('${name}')">🪄 Smart autoclip</button>
+      <span class="hint" id="smartClipStat"></span>
       <a href="/api/datasets/${encodeURIComponent(name)}/export?t=${encodeURIComponent(TOKEN)}" download="${name}.zip"><button type="button">⬇ Export ZIP</button></a>
       <button type="button" class="primary" onclick="saveAllCaptions('${name}')">Save dataset</button></div>
     <div class="enh-panel" id="enhancePanel">
@@ -915,6 +917,39 @@ async function autoclipVideos(name){
     toast(msg);
     renderItems(name);
   }catch(e){ toast('Autoclip failed: '+e.message); }
+}
+
+let smartClipTimer = null;
+
+async function autoclipSmart(name){
+  const clip_seconds = parseFloat($('#autoclipSeconds')?.value) || 3;
+  const selectedVideos = [...document.querySelectorAll('#dsgrid .selchk:checked')]
+    .map(el => el.dataset.image)
+    .filter(img => _dsItemsCache.find(it => it.image === img)?.is_video);
+  let videos = selectedVideos;
+  if (!videos.length){
+    const totalVideos = _dsItemsCache.filter(it => it.is_video).length;
+    if (!totalVideos){ toast('No videos in this dataset.'); return; }
+    if (!(await modalConfirm(`No videos selected: use Gemini to find motion and autoclip all ${totalVideos} videos (up to 3 clips each)?`))) return;
+    videos = null;
+  }
+  const model = $('#cap_model')?.value;
+  const trigger_word = ($('#cap_trigger')?.value || '').trim();
+  try{
+    await post(`/api/datasets/${encodeURIComponent(name)}/autoclip/smart`, {videos, clip_seconds, model, trigger_word});
+  }catch(e){ toast(e.message); return; }
+  clearInterval(smartClipTimer);
+  const stat = $('#smartClipStat');
+  smartClipTimer = setInterval(async ()=>{
+    const s = await api(`/api/datasets/${encodeURIComponent(name)}/autoclip/smart-status`);
+    if (stat) stat.textContent = `${s.status} ${s.done||0}/${s.total||0}` + (s.errors?.length ? ` · ${s.errors.length} errors` : '');
+    if (['finished','cancelled','idle'].includes(s.status)){
+      clearInterval(smartClipTimer);
+      renderItems(name);
+      if (s.status === 'finished') toast(`Smart autoclip done: ${s.clips_created||0} clips created.`);
+      if (s.errors?.length) toast(s.errors[0]);
+    }
+  }, 2500);
 }
 
 function updateSelCount(){
