@@ -31,11 +31,21 @@ WHAT THIS FIRST DRAFT DELIBERATELY DOES NOT DO
   of training them as if they were plain FL2VA, but a real multi-reference
   dataset format (separate reference images, not just first-frame-of-clip)
   is future work, not done here.
-- No audio training by default (`--train_audio 0`). The stated first targets
-  (NSFW, yoga, cartoon) are visual styles, not audio concepts, and skipping
-  audio means skipping the whole audio-VAE/waveform-extraction path entirely
-  (num_audio_latents=0 keeps the packed sequence video+text only) rather than
-  half-implementing it. `--train_audio 1` is there for later.
+- Audio training is opt-in (`--train_audio 0` by default). The stated first
+  targets (NSFW, yoga, cartoon) are visual styles, not audio concepts, so most
+  runs still skip the whole audio-VAE/waveform-extraction path entirely
+  (num_audio_latents=0 keeps the packed sequence video+text only). When enabled,
+  each clip's own audio track (same cropped time window as its video frames) is
+  encoded via AutoencoderKLMiniMaxH3Audio (mono VAE, stereo handled as two batch
+  items, `.mode()` not `.sample()` -- matching the real reference-conditioning
+  encoder step's own convention, read from source, not guessed), noised with the
+  model's own audio_shift=3.0 schedule (reusing the same MiniMaxH3Scheduler
+  instance as video -- scale_noise() is shift-independent, confirmed via
+  source), and trained against `output.audio_sample` with an independent MSE
+  term (`--audio_loss_weight`, default 1.0, matching a real third-party
+  checkpoint's `ss_h3_audio_loss_weight: 1` metadata convention). Clips with no
+  audio stream at all train video-only for that step rather than being taught
+  silence.
 - No training-time sample video generation. Reusing the modular inference
   pipeline for periodic previews is a real chunk of work on its own (assembling
   the actual T2VABlocks graph) -- deferred rather than half-built here.
@@ -190,6 +200,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video_shift", type=float, default=12.0)  # MiniMax-H3's own default for video rows
     parser.add_argument("--audio_shift", type=float, default=3.0)  # MiniMax-H3's own default for audio rows
     parser.add_argument("--train_audio", type=int, default=0)  # 0 = video+text only; see module docstring
+    parser.add_argument("--audio_loss_weight", type=float, default=1.0)  # matches ss_h3_audio_loss_weight: 1 convention
     parser.add_argument("--base_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--quantize_base", type=int, default=1)  # 4-bit (nf4) frozen base; ~33B model, LoRA-only fits nothing else
     parser.add_argument("--seed", type=int, default=42)
@@ -223,8 +234,12 @@ def dataset_clips(dataset_dir: Path, caption_extension: str) -> list[tuple[Path,
 def load_and_prepare_clip(path, num_frames: int, resolve_canvas_size):
     """Read a video file, align its frame count to the nearest valid 17n+5, resize/center-crop
     to MiniMax-H3's fixed-short-edge canvas for the clip's own aspect ratio, return a
-    (C, num_frames, H, W) float tensor in [0, 1] (the VAE's own encode() then applies the
-    ImageNet normalization documented in autoencoder_kl_minimax_h3.py -- not done here).
+    ((C, num_frames, H, W) float tensor in [0, 1], clip_start_seconds, clip_duration_seconds) tuple
+    (the VAE's own encode() then applies the ImageNet normalization documented in
+    autoencoder_kl_minimax_h3.py -- not done here). The start/duration are in seconds at
+    MiniMax-H3's fixed 24fps, so load_audio_waveform() can extract the exact matching time window
+    from the same source file when --train_audio is on -- audio and video must cover the same
+    content, not just the same clip file.
 
     Decodes via PyAV rather than torchvision.io.read_video -- torchvision has been shuffling its
     video-reading backend across releases (this trainer's own first live run hit exactly that:
@@ -253,9 +268,14 @@ def load_and_prepare_clip(path, num_frames: int, resolve_canvas_size):
     if video.shape[0] < aligned:
         pad = video[-1:].repeat(aligned - video.shape[0], 1, 1, 1)
         video = torch.cat([video, pad], dim=0)
+        start = 0
     else:
         start = random.randint(0, video.shape[0] - aligned)
         video = video[start:start + aligned]
+    # Both start and aligned are frame counts on the already-24fps-resampled timeline above, so
+    # dividing by MINIMAX_H3_FPS gives seconds regardless of the source file's own frame rate.
+    clip_start_seconds = start / MINIMAX_H3_FPS
+    clip_duration_seconds = aligned / MINIMAX_H3_FPS
 
     _, _, h, w = video.shape  # video is still (T, C, H, W) here
     height, width = resolve_canvas_size(w, h)
@@ -268,7 +288,79 @@ def load_and_prepare_clip(path, num_frames: int, resolve_canvas_size):
     top = max(0, (resized_h - height) // 2)
     left = max(0, (resized_w - width) // 2)
     video = video[:, :, top:top + height, left:left + width]  # (T, C, height, width)
-    return video.permute(1, 0, 2, 3)  # (C, T, height, width)
+    return video.permute(1, 0, 2, 3), clip_start_seconds, clip_duration_seconds  # (C, T, height, width)
+
+
+def load_audio_waveform(path, start_seconds: float, duration_seconds: float, target_sample_rate: int):
+    """Extract the stereo waveform for the same time window load_and_prepare_clip() cropped the
+    video to, resampled to the audio VAE's fixed 32kHz stereo input. Returns None when the file has
+    no audio stream, or when its audio track doesn't even reach the video crop's start time -- both
+    left as video-only for that step rather than synthesizing silence, same reasoning as this
+    trainer's original --train_audio 0 default (silence would actively teach the model to output
+    silence, worse than not training audio on that clip at all).
+
+    Decodes the whole track and slices by sample index rather than seeking, mirroring
+    load_and_prepare_clip()'s own decode-then-slice approach -- these are short training clips, not
+    long-form video, so this isn't a hot-path performance concern, and it sidesteps PyAV seek()
+    only guaranteeing landing at or before a keyframe (imprecise for audio-sample-accurate slicing).
+
+    format="fltp" (planar float) rather than a packed/interleaved format -- planar keeps each
+    channel's samples contiguous, matching the (channels, samples) layout this function returns
+    directly."""
+    import av
+    import numpy as np
+    import torch
+
+    container = av.open(str(path))
+    if not container.streams.audio:
+        container.close()
+        return None
+    stream = container.streams.audio[0]
+    resampler = av.AudioResampler(format="fltp", layout="stereo", rate=target_sample_rate)
+
+    chunks = [
+        resampled.to_ndarray()
+        for frame in container.decode(stream)
+        for resampled in resampler.resample(frame)
+    ]
+    container.close()
+    if not chunks:
+        return None
+
+    waveform = np.concatenate(chunks, axis=1)  # (2, total_samples) float32, planar
+    if waveform.shape[0] == 1:
+        waveform = np.repeat(waveform, 2, axis=0)  # mono source -> duplicate to the VAE's fixed 2-channel convention
+
+    start_sample = round(start_seconds * target_sample_rate)
+    target_samples = round(duration_seconds * target_sample_rate)
+    if start_sample >= waveform.shape[1]:
+        return None
+    segment = waveform[:, start_sample:start_sample + target_samples]
+    if segment.shape[1] < target_samples:
+        pad_width = target_samples - segment.shape[1]
+        pad = (
+            np.repeat(segment[:, -1:], pad_width, axis=1)
+            if segment.shape[1] > 0 else np.zeros((2, pad_width), dtype=np.float32)
+        )
+        segment = np.concatenate([segment, pad], axis=1)
+
+    return torch.from_numpy(segment.copy())  # (2, target_samples) float32
+
+
+def pack_audio_latents(latents: "torch.Tensor") -> "torch.Tensor":
+    """Inverse of diffusers' own packing.unpack_audio_tokens() (decode-side: packed rows -> VAE
+    latents) -- diffusers doesn't ship the training-side direction, so it's hand-written here,
+    derived directly from unpack_audio_tokens' own reshape (`rows.reshape(2, num_audio_latents,
+    C).permute(0, 2, 1)` to recover the VAE-native (2, C, T) layout) and from the real
+    reference-conditioning encoder step's own output layout (`posterior.mode().transpose(1, 2)`,
+    already (2, T, C) -- channel-major, the batch dim standing in for the two stereo channels,
+    confirmed by reading both directly from diffusers source rather than assumed).
+
+    Input here is expected in that same (2, T, C) layout (channels, time, latent_dim) -- already
+    what encode+mode+transpose produces, so no permute is needed, just the row-major flatten
+    unpack_audio_tokens' own reshape(2, T, C) exactly inverts."""
+    channels, num_audio_latents, latent_channels = latents.shape
+    return latents.reshape(channels * num_audio_latents, latent_channels)
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +390,8 @@ def load_encoders(args, device):
     import torch
     from diffusers import AutoencoderKLMiniMaxH3, MiniMaxH3Scheduler
     from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration
+    if args.train_audio:
+        from diffusers import AutoencoderKLMiniMaxH3Audio
 
     dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
 
@@ -328,18 +422,18 @@ def load_encoders(args, device):
 
     video_scheduler = MiniMaxH3Scheduler(shift=args.video_shift)
 
+    audio_vae = None
     if args.train_audio:
-        # The training loop below has no real audio waveform extraction/encoding path yet (see the
-        # module docstring's "what this first draft deliberately does not do") -- it would otherwise
-        # silently train against a zero/silence target, actively teaching the model to output silence.
-        # Fail loudly instead of shipping that.
-        raise NotImplementedError(
-            "--train_audio 1 is not implemented yet in this first draft: audio waveform extraction "
-            "and audio VAE encoding are not wired into the training loop. Leave --train_audio 0 "
-            "(the default) for video-only style/motion LoRAs."
-        )
+        say("Loading audio VAE...")
+        # Shared top-level "audio_vae" subfolder (confirmed via model_index.json), same partition-
+        # independence as the video "vae" folder above.
+        audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="audio_vae", torch_dtype=torch.float32,
+        ).to(device)
+        audio_vae.requires_grad_(False)
+        audio_vae.eval()
 
-    return vae, text_encoder, tokenizer, video_scheduler
+    return vae, text_encoder, tokenizer, video_scheduler, audio_vae
 
 
 def load_transformer(args, device):
@@ -477,7 +571,7 @@ def sample_shifted_sigma(shift: float, batch_size: int, device) -> "torch.Tensor
     return shift * base / (1 + (shift - 1) * base)
 
 
-def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_canvas_size):
+def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_canvas_size, audio_vae=None):
     """Run the frozen VAE + text encoder once over the whole dataset and cache their outputs on
     CPU. Captions and videos are static across the whole run (no augmentation), so re-running these
     two frozen, ~10-65GB-each models every single step would be pure waste even with infinite VRAM --
@@ -497,10 +591,18 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
     # Ref2VA usage, and how it could extend to real separate reference images later).
     use_reference = args.partition == "Ref2VA"
 
+    audio_latents_mean = audio_latents_std = None
+    if audio_vae is not None:
+        audio_latents_mean = torch.tensor(audio_vae.config.latents_mean, device=device).view(1, 1, -1)
+        audio_latents_std = torch.tensor(audio_vae.config.latents_std, device=device).view(1, 1, -1)
+
     cache = []
     with torch.no_grad():
         for i, (path, caption) in enumerate(clips):
-            pixels = load_and_prepare_clip(path, args.num_frames, resolve_canvas_size).unsqueeze(0).to(device)
+            clip, clip_start_seconds, clip_duration_seconds = load_and_prepare_clip(
+                path, args.num_frames, resolve_canvas_size
+            )
+            pixels = clip.unsqueeze(0).to(device)
             vae_input = (pixels.to(torch.float32) - imagenet_mean) / imagenet_std
             video_latents = vae.encode(vae_input).latent_dist.sample()
             video_latents = (video_latents - latents_mean) / latents_std
@@ -539,9 +641,25 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
             )
             text_embeds = text_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
 
+            audio_latents = None
+            if audio_vae is not None:
+                waveform = load_audio_waveform(
+                    path, clip_start_seconds, clip_duration_seconds, MINIMAX_H3_AUDIO_SAMPLE_RATE
+                )
+                if waveform is not None:
+                    audio_input = waveform.to(device)[:, None]  # (2, 1, samples) -- stereo as 2 batch items
+                    # return_dict=False, [0] -- matches the real reference-conditioning encoder step's
+                    # own call exactly (posterior returned bare, not wrapped in an EncoderOutput.latent_dist).
+                    posterior = audio_vae.encode(audio_input, return_dict=False)[0]
+                    audio_latents = posterior.mode().float().transpose(1, 2)  # (2, T, 32)
+                    audio_latents = (audio_latents - audio_latents_mean) / audio_latents_std
+                else:
+                    warn(f"{path.name}: no usable audio for this crop window, training video-only for this clip.")
+
             cache.append((
                 video_latents.cpu(), text_embeds.cpu(),
                 reference_latents.cpu() if reference_latents is not None else None,
+                audio_latents.cpu() if audio_latents is not None else None,
             ))
             say(f"Cached {i + 1}/{len(clips)}: {path.name}")
     return cache
@@ -654,10 +772,10 @@ def main() -> None:
     # Phase 1: encode everything, then free the encoders. Peak memory here is VAE (~10GB fp32) +
     # text encoder (~33-66GB depending on --base_dtype) -- no transformer, no gradients, no
     # optimizer state, since this is a forward-only pass over frozen models.
-    vae, text_encoder, tokenizer, video_scheduler = load_encoders(args, device)
-    cache = precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_canvas_size)
+    vae, text_encoder, tokenizer, video_scheduler, audio_vae = load_encoders(args, device)
+    cache = precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_canvas_size, audio_vae)
     say("Freeing VAE + text encoder from GPU memory (cached outputs live on CPU now)...")
-    del vae, text_encoder, tokenizer
+    del vae, text_encoder, tokenizer, audio_vae
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -686,7 +804,7 @@ def main() -> None:
         step_start = time.time()
         if global_step % len(cache) == 0:
             random.shuffle(order)
-        video_latents, text_embeds, reference_latents = cache[order[global_step % len(cache)]]
+        video_latents, text_embeds, reference_latents, audio_latents = cache[order[global_step % len(cache)]]
         video_latents = video_latents.to(device)
         text_embeds = text_embeds.to(device, dtype=torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16)
         text_token_tags = torch.ones(text_embeds.shape[1], dtype=torch.long)  # 1 = text (no keyframe vision blocks)
@@ -700,16 +818,19 @@ def main() -> None:
         # gets one "first" entry and the packed sequence gains condition rows ahead of the target video
         # rows. FL2VA clips have no cached reference and train exactly as before (plain T2VA).
         has_reference = reference_latents is not None
+        # A cached audio latent means --train_audio was on AND this clip had a usable audio track
+        # for its cropped time window (see precompute_cache()/load_audio_waveform()) -- clips without
+        # one train video-only for this step rather than being taught silence.
+        has_audio = audio_latents is not None
+        num_audio_latents = audio_latents.shape[1] if has_audio else 0
 
         # num_audio_latents=0 -> no audio rows at all in the packed sequence (not silence, just absent).
-        # --train_audio always raises in load_encoders() before reaching here -- see that function's
-        # docstring for why "train on silence" would be worse than not training audio at all.
         layout = build_packed_sequence(
             text_token_tags=text_token_tags,
             num_latent_frames=num_latent_frames,
             latent_height=latent_height,
             latent_width=latent_width,
-            num_audio_latents=0,
+            num_audio_latents=num_audio_latents,
             patch_size=patch_size,
             keyframe_anchors=("first",) if has_reference else (),
         )
@@ -743,16 +864,31 @@ def main() -> None:
             condition_rows = patchify_video_latents(noisy_reference, patch_size).unsqueeze(0)
             noisy_video_rows = torch.cat([condition_rows, noisy_video_rows], dim=1)
 
-        empty_audio_rows = torch.zeros(batch_size, 0, transformer.config.audio_in_channels, device=device)
+        # Independent noise level from video -- MiniMax-H3's own audio_shift=3.0 schedule (video is
+        # 12.0), reusing the same MiniMaxH3Scheduler instance for both since scale_noise() is
+        # shift-independent (`x_t = t*x0 + (1-t)*noise`, confirmed via scheduling_minimax_h3.py source
+        # -- the shift only shapes set_timesteps()'s inference sigma grid, not scale_noise() itself).
+        if has_audio:
+            audio_latents = audio_latents.to(device)
+            audio_noise = torch.randn_like(audio_latents)
+            audio_sigma = sample_shifted_sigma(args.audio_shift, batch_size, device)
+            audio_t = (1.0 - audio_sigma).mean().item()
+            noisy_audio = video_scheduler.scale_noise(audio_latents, audio_t, audio_noise)
+            audio_target = audio_latents - audio_noise  # data-ward velocity, same convention as video
+            noisy_audio_rows = pack_audio_latents(noisy_audio).unsqueeze(0)
+            target_audio_rows = pack_audio_latents(audio_target).unsqueeze(0)
+        else:
+            audio_t = video_t  # unused (num_condition_audio_rows is always 0, no audio reference conditioning exists)
+            noisy_audio_rows = torch.zeros(batch_size, 0, transformer.config.audio_in_channels, device=device)
 
         timesteps, timestep_indices = build_row_timesteps(
-            layout, video_timestep=video_t, audio_timestep=video_t,
-            condition_video_timestep=condition_video_t, condition_audio_timestep=video_t,
+            layout, video_timestep=video_t, audio_timestep=audio_t,
+            condition_video_timestep=condition_video_t, condition_audio_timestep=audio_t,
         )
 
         output = transformer(
             hidden_states=noisy_video_rows,
-            audio_hidden_states=empty_audio_rows,
+            audio_hidden_states=noisy_audio_rows,
             encoder_hidden_states=text_embeds,
             timestep=timesteps.to(device),
             timestep_indices=timestep_indices.to(device),
@@ -768,6 +904,14 @@ def main() -> None:
         # matching layout.num_condition_video_rows exactly (0 when there's no reference, a no-op slice).
         output_sample = output.sample[:, layout.num_condition_video_rows:]
         loss = torch.nn.functional.mse_loss(output_sample.float(), target_video_rows.float())
+        audio_loss_value = None
+        if has_audio:
+            # No slicing needed here (unlike the video sample above) -- num_condition_audio_rows is
+            # always 0, since no audio reference/keyframe conditioning path exists in this trainer,
+            # so every row in output.audio_sample is a real generation target already.
+            audio_loss = torch.nn.functional.mse_loss(output.audio_sample.float(), target_audio_rows.float())
+            audio_loss_value = audio_loss.item()
+            loss = loss + args.audio_loss_weight * audio_loss
 
         loss.backward()
         optimizer.step()
@@ -785,12 +929,15 @@ def main() -> None:
             # produces a wildly inflated ETA on step 1 in particular.
             "t": time.time(),
         }
+        if audio_loss_value is not None:
+            metrics_row["audio_loss"] = round(audio_loss_value, 6)
         with open(metrics_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(metrics_row) + "\n")
         # Every step for the first 10 (fast feedback on real per-step speed without waiting on a
         # 10-step average), then every 10th after that to keep the log from getting noisy.
         if global_step <= 10 or global_step % 10 == 0:
-            say(f"step {global_step}/{args.max_train_steps} loss={loss.item():.4f} ({step_seconds:.1f}s/step)")
+            audio_suffix = f" audio_loss={audio_loss_value:.4f}" if audio_loss_value is not None else ""
+            say(f"step {global_step}/{args.max_train_steps} loss={loss.item():.4f}{audio_suffix} ({step_seconds:.1f}s/step)")
 
         if global_step % args.save_every_n_steps == 0 or global_step == args.max_train_steps:
             # NOT transformer.save_lora_adapter() -- that method is broken for a quantized model at

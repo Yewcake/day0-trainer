@@ -1343,6 +1343,7 @@ def create_job(payload: dict) -> dict:
         "validation_image": "", "validation_prompt": "", "auto_analyze": False,
         "masterchef_enabled": False, "include_text_fusion": False,
         "partition": "FL2VA", "num_frames": 73, "short_edge": 768,
+        "train_audio": False, "audio_loss_weight": 1.0,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -1399,6 +1400,8 @@ def create_job(payload: dict) -> dict:
             "--lr_warmup_steps", str(config["warmup_steps"]),
             "--train_batch_size", str(config["batch_size"]),
             "--gradient_checkpointing", str(config["gradient_checkpointing"]),
+            "--train_audio", "1" if config["train_audio"] else "0",
+            "--audio_loss_weight", str(config["audio_loss_weight"]),
             "--seed", str(config["seed"]),
         ]
     else:

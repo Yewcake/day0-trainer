@@ -323,6 +323,9 @@ async function showTrain(){
         <option value="512">512px (~2.25x fewer tokens, quick training)</option>
         <option value="384">384px (~4x fewer tokens, fastest, more quality risk)</option>
       </select></div>
+    <div class="row" id="row-h3-audio" style="display:none"><label>Train audio</label>
+      <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_trainaudio" style="width:auto">Also train each clip's own audio track (skips clips with no usable audio for that crop), off by default, style/motion LoRAs don't need it</label>
+    </div>
     <div class="row" id="row-steps"><label>Steps</label><input id="f_steps" type="number" value="2000" oninput="updateScheduleDisplay()"></div>
     <div class="row"><label>Save every</label><input id="f_save" type="number" value="250"></div>
     <div class="row" id="row-sample-every"><label>Sample every</label><input id="f_sample" type="number" value="500"></div>
@@ -388,7 +391,7 @@ function onModelChange(){
     if (tf) tf.checked = false;
   }
 
-  ['row-h3-partition', 'row-h3-frames', 'row-h3-shortedge'].forEach(id => { const el = $('#'+id); if (el) el.style.display = isH3 ? '' : 'none'; });
+  ['row-h3-partition', 'row-h3-frames', 'row-h3-shortedge', 'row-h3-audio'].forEach(id => { const el = $('#'+id); if (el) el.style.display = isH3 ? '' : 'none'; });
   ['row-resolution', 'row-optimizer', 'row-sample-every', 'row-sample-prompts',
    'row-autoanalyze', 'row-valimage', 'row-valprompt'].forEach(id => {
     const el = $('#'+id); if (el) el.style.display = isH3 ? 'none' : '';
@@ -535,6 +538,7 @@ async function submitJob(ev){
     include_text_fusion: $('#f_include_text_fusion').checked,
     partition: $('#f_partition').value, num_frames:+$('#f_numframes').value,
     short_edge:+$('#f_shortedge').value,
+    train_audio: $('#f_trainaudio')?.checked || false,
     sample_prompts: prompts,
   };
   try{ const job = await post('/api/jobs', payload); toast('Training started.'); openJob(job.id); }
