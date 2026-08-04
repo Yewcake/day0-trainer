@@ -140,7 +140,23 @@ def job_status(job_id: str) -> str:
         if code is None:
             return "running"
         _active.pop(job_id, None)
-        return "finished" if code == 0 else "failed"
+        status = "finished" if code == 0 else "failed"
+        # This branch runs on every /api/jobs poll while the job is still tracked in `_active`, so
+        # it's the one that actually determines what the UI shows first, before reap_finished()'s
+        # own periodic sweep would otherwise catch the same transition -- needs the same exit-code
+        # logging, or a "failed" status with a clean "Training complete." log and no traceback stays
+        # just as unexplained as it was before (see reap_finished() for the full reasoning).
+        set_status(job_id, status, exit_code=code)
+        if status == "failed":
+            detail = f"signal {-code}" if code < 0 else f"exit code {code}"
+            try:
+                with (job_dir(job_id) / "log.txt").open("a", encoding="utf-8") as fh:
+                    fh.write(f"\n[day0] Process ended: {detail}.\n")
+            except Exception:
+                pass
+        elif status == "finished":
+            maybe_auto_analyze(job_id)
+        return status
     status_file = job_dir(job_id) / "status.json"
     if not status_file.exists():
         return "unknown"
@@ -159,7 +175,7 @@ def job_status(job_id: str) -> str:
     return status or "unknown"
 
 
-def set_status(job_id: str, status: str, pid: int | None = None) -> None:
+def set_status(job_id: str, status: str, pid: int | None = None, exit_code: int | None = None) -> None:
     payload = {"status": status, "ts": time.time()}
     status_file = job_dir(job_id) / "status.json"
     if pid is not None:
@@ -173,6 +189,8 @@ def set_status(job_id: str, status: str, pid: int | None = None) -> None:
                 payload["pid"] = existing_pid
         except Exception:
             pass
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
     status_file.write_text(json.dumps(payload))
 
 
@@ -182,7 +200,20 @@ def reap_finished() -> None:
         if code is not None:
             _active.pop(job_id, None)
             status = "finished" if code == 0 else "failed"
-            set_status(job_id, status)
+            set_status(job_id, status, exit_code=code)
+            if status == "failed":
+                # Popen.returncode is negative-N when the process was killed by signal N (e.g. -11
+                # SIGSEGV, -6 SIGABRT), positive for a normal nonzero sys.exit()/os._exit(). This is
+                # the one piece of information "failed" alone doesn't carry -- a MiniMax-H3 run that
+                # printed "Training complete." with no traceback and still failed needs exactly this
+                # to tell a genuine training bug apart from a CUDA-teardown crash after the fact, and
+                # it wasn't visible anywhere before (job_status() only ever exposed the string).
+                detail = f"signal {-code}" if code < 0 else f"exit code {code}"
+                try:
+                    with (job_dir(job_id) / "log.txt").open("a", encoding="utf-8") as fh:
+                        fh.write(f"\n[day0] Process ended: {detail}.\n")
+                except Exception:
+                    pass
             if status == "finished":
                 maybe_auto_analyze(job_id)
 
