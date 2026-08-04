@@ -1428,7 +1428,20 @@ async function drawMetrics(id){
   if (data.elapsed_seconds != null){
     timerHtml = ` · elapsed <b>${formatDuration(data.elapsed_seconds)}</b>`;
     if (data.status === 'running' && data.total_steps && last.step > 0){
-      const secPerStep = data.elapsed_seconds / last.step;
+      // Prefer a windowed rate from the metrics rows' own per-step timestamps (recent throughput
+      // only, up to the last 20 steps) over (job elapsed since launch)/(steps so far) -- the latter
+      // folds one-time setup (dataset caching, model/checkpoint loading) into the rate and produces
+      // a wildly inflated ETA early in a run, especially right after a long caching phase. Falls
+      // back to the old method for trainers/jobs whose metrics rows don't carry a timestamp yet.
+      const timed = pts.filter(p => p.t != null);
+      let secPerStep = null;
+      if (timed.length >= 2){
+        const windowStart = timed[Math.max(0, timed.length - 21)];
+        const windowEnd = timed.at(-1);
+        const stepSpan = windowEnd.step - windowStart.step;
+        if (stepSpan > 0) secPerStep = (windowEnd.t - windowStart.t) / stepSpan;
+      }
+      if (secPerStep == null) secPerStep = data.elapsed_seconds / last.step;
       const remaining = secPerStep * Math.max(0, data.total_steps - last.step);
       timerHtml += ` · ETA <b>${formatDuration(remaining)}</b>`;
     }

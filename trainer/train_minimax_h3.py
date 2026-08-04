@@ -74,6 +74,7 @@ import os
 import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Must be set before any CUDA context exists (i.e. before torch is ever imported, including by
@@ -270,6 +271,12 @@ def get_device() -> "torch.device":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         warn("No CUDA device found -- this will run (uselessly slowly) on CPU. Expected on a RunPod GPU pod.")
+    else:
+        # Printed once at startup so a slow run can be diagnosed from the log alone -- e.g. distinguishing
+        # a genuinely underpowered/shared GPU from a code-level slowdown without needing to ask.
+        name = torch.cuda.get_device_name(device)
+        total_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+        say(f"GPU: {name} ({total_gb:.1f}GB), compute capability {'.'.join(map(str, torch.cuda.get_device_capability(device)))}")
     return device
 
 
@@ -536,6 +543,7 @@ def main() -> None:
     global_step = 0
     order = list(range(len(cache)))
     while global_step < args.max_train_steps:
+        step_start = time.time()
         if global_step % len(cache) == 0:
             random.shuffle(order)
         video_latents, text_embeds = cache[order[global_step % len(cache)]]
@@ -602,14 +610,22 @@ def main() -> None:
         optimizer.zero_grad()
 
         global_step += 1
+        step_seconds = time.time() - step_start
         metrics_row = {
             "step": global_step, "loss": round(loss.item(), 6),
             "lr": lr_scheduler.get_last_lr()[0], "epoch": global_step // max(1, len(clips)),
+            # Wall-clock time of this step, not present in older runs -- lets the UI compute ETA
+            # from actual recent step throughput instead of (job elapsed since launch) / (steps so
+            # far), which folds one-time setup (caching, model/checkpoint loading) into the rate and
+            # produces a wildly inflated ETA on step 1 in particular.
+            "t": time.time(),
         }
         with open(metrics_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(metrics_row) + "\n")
-        if global_step % 10 == 0 or global_step == 1:
-            say(f"step {global_step}/{args.max_train_steps} loss={loss.item():.4f}")
+        # Every step for the first 10 (fast feedback on real per-step speed without waiting on a
+        # 10-step average), then every 10th after that to keep the log from getting noisy.
+        if global_step <= 10 or global_step % 10 == 0:
+            say(f"step {global_step}/{args.max_train_steps} loss={loss.item():.4f} ({step_seconds:.1f}s/step)")
 
         if global_step % args.save_every_n_steps == 0 or global_step == args.max_train_steps:
             # NOT transformer.save_lora_adapter() -- that method is broken for a quantized model at
