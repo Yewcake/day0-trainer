@@ -513,16 +513,12 @@ def dataset_thumb(name: str, image: str, size: int = 220) -> FileResponse:
     return FileResponse(thumb)
 
 
-@app.get("/api/datasets/{name}/video-meta/{video}", dependencies=[Depends(require_auth)])
-def video_meta(name: str, video: str) -> dict:
-    """Duration/dimensions for the trim tool's timeline + canvas-size preview.
+def _probe_video(source: Path) -> dict:
+    """width/height/duration via ffprobe -- shared by video_meta and autoclip.
 
     The per-stream `duration` field ffprobe reports is frequently missing or wrong (many mp4/webm/mkv
     muxings just don't tag it on the video stream itself) -- the container-level `format.duration` is
     the reliable one, so that's read too and preferred whenever the stream value looks bogus."""
-    source = dataset_dir(name) / safe_name(video)
-    if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
-        raise HTTPException(status_code=404, detail="Video not found.")
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         raise HTTPException(status_code=500, detail="ffprobe is required but was not found.")
@@ -546,6 +542,15 @@ def video_meta(name: str, video: str) -> dict:
     }
 
 
+@app.get("/api/datasets/{name}/video-meta/{video}", dependencies=[Depends(require_auth)])
+def video_meta(name: str, video: str) -> dict:
+    """Duration/dimensions for the trim tool's timeline + canvas-size preview."""
+    source = dataset_dir(name) / safe_name(video)
+    if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(status_code=404, detail="Video not found.")
+    return _probe_video(source)
+
+
 def _ffmpeg_cut(ffmpeg: str, source: Path, start: float, end: float, dest: Path) -> None:
     # -ss after -i (input seeking) is frame-accurate, unlike the fast-but-keyframe-snapped
     # -ss-before-i form -- worth the slower re-encode for a short curation clip.
@@ -563,6 +568,46 @@ def _clear_thumb_cache(target: Path, filename: str) -> None:
     if thumb_dir.is_dir():
         for stale in thumb_dir.glob(f"*_{filename}.jpg"):
             stale.unlink(missing_ok=True)
+
+
+def _split_into_chunks(ffmpeg: str, target: Path, source: Path, start: float, end: float, chunk_seconds: float) -> list[str]:
+    """Cut [start, end] of source into consecutive chunk_seconds-long pieces -- shared by the
+    single-video trim tool and the bulk autoclip endpoint. The first chunk overwrites source in
+    place; later chunks are new files sharing its caption as a starting point (edit each afterward,
+    the same caption rarely fits every chunk exactly). Any leftover shorter than chunk_seconds at
+    the end is dropped, not padded into its own clip."""
+    n_chunks = max(1, int((end - start) // chunk_seconds))
+    caption_file = source.with_suffix(".txt")
+    caption_text = caption_file.read_text(encoding="utf-8") if caption_file.exists() else ""
+    stem = source.stem
+
+    # Cut every chunk from the original file first, into temp files -- only once all of them exist
+    # is `source` itself overwritten. Cutting chunk 0 in place before cutting chunk 1 would mean
+    # chunk 1 gets cut from the already-truncated chunk-0 output instead of the original footage.
+    tmp_paths = []
+    try:
+        for i in range(n_chunks):
+            chunk_start = start + i * chunk_seconds
+            chunk_end = chunk_start + chunk_seconds
+            handle, tmp_path = tempfile.mkstemp(suffix=source.suffix)
+            os.close(handle)
+            _ffmpeg_cut(ffmpeg, source, chunk_start, chunk_end, Path(tmp_path))
+            tmp_paths.append(Path(tmp_path))
+
+        created = []
+        shutil.move(str(tmp_paths[0]), source)
+        _clear_thumb_cache(target, source.name)
+        created.append(source.name)
+        for i, tmp_path in enumerate(tmp_paths[1:], start=2):
+            dest = target / f"{stem}_part{i}{source.suffix}"
+            shutil.move(str(tmp_path), dest)
+            if caption_text:
+                dest.with_suffix(".txt").write_text(caption_text, encoding="utf-8")
+            created.append(dest.name)
+    finally:
+        for tmp_path in tmp_paths:
+            tmp_path.unlink(missing_ok=True)  # no-op for any already moved into place
+    return created
 
 
 @app.post("/api/datasets/{name}/trim/{video}", dependencies=[Depends(require_auth)])
@@ -602,38 +647,39 @@ def trim_video(name: str, video: str, payload: dict) -> dict:
         _clear_thumb_cache(target, source.name)
         return {"ok": True, "clips_created": 1}
 
-    n_chunks = max(1, int((end - start) // chunk_seconds))
-    caption_file = source.with_suffix(".txt")
-    caption_text = caption_file.read_text(encoding="utf-8") if caption_file.exists() else ""
-    stem = source.stem
-
-    # Cut every chunk from the original file first, into temp files -- only once all of them exist
-    # is `source` itself overwritten. Cutting chunk 0 in place before cutting chunk 1 would mean
-    # chunk 1 gets cut from the already-truncated chunk-0 output instead of the original footage.
-    tmp_paths = []
-    try:
-        for i in range(n_chunks):
-            chunk_start = start + i * chunk_seconds
-            chunk_end = chunk_start + chunk_seconds
-            handle, tmp_path = tempfile.mkstemp(suffix=source.suffix)
-            os.close(handle)
-            _ffmpeg_cut(ffmpeg, source, chunk_start, chunk_end, Path(tmp_path))
-            tmp_paths.append(Path(tmp_path))
-
-        created = []
-        shutil.move(str(tmp_paths[0]), source)
-        _clear_thumb_cache(target, source.name)
-        created.append(source.name)
-        for i, tmp_path in enumerate(tmp_paths[1:], start=2):
-            dest = target / f"{stem}_part{i}{source.suffix}"
-            shutil.move(str(tmp_path), dest)
-            if caption_text:
-                dest.with_suffix(".txt").write_text(caption_text, encoding="utf-8")
-            created.append(dest.name)
-    finally:
-        for tmp_path in tmp_paths:
-            tmp_path.unlink(missing_ok=True)  # no-op for any already moved into place
+    created = _split_into_chunks(ffmpeg, target, source, start, end, chunk_seconds)
     return {"ok": True, "clips_created": len(created), "clips": created}
+
+
+@app.post("/api/datasets/{name}/autoclip", dependencies=[Depends(require_auth)])
+def autoclip_videos(name: str, payload: dict) -> dict:
+    """Bulk version of the trim tool's chunk-splitting: cut every selected video (or every video in
+    the dataset, if none are named) into consecutive same-length clips covering its full duration --
+    for turning a folder of raw takes into short training-length clips in one pass instead of doing
+    each one by hand in the trim tool. Same _partN naming and caption-copying as a manual chunked
+    trim. Videos shorter than clip_seconds are skipped outright, not padded or force-included."""
+    target = dataset_dir(name)
+    clip_seconds = float(payload.get("clip_seconds") or 0)
+    if clip_seconds <= 0:
+        raise HTTPException(status_code=400, detail="clip_seconds must be > 0.")
+    requested = payload.get("videos")
+    videos = [target / safe_name(v) for v in requested] if requested else dataset_videos(target)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail="ffmpeg is required but was not found.")
+
+    videos_processed, clips_created, skipped = 0, 0, []
+    for source in videos:
+        if not source.is_file() or source.suffix.lower() not in VIDEO_EXTS:
+            skipped.append(source.name)
+            continue
+        duration = _probe_video(source)["duration"]
+        if duration < clip_seconds:
+            skipped.append(source.name)
+            continue
+        clips_created += len(_split_into_chunks(ffmpeg, target, source, 0, duration, clip_seconds))
+        videos_processed += 1
+    return {"ok": True, "videos_processed": videos_processed, "clips_created": clips_created, "skipped": skipped}
 
 
 @app.put("/api/datasets/{name}/caption/{image}", dependencies=[Depends(require_auth)])

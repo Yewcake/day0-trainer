@@ -684,6 +684,8 @@ async function openDataset(name){
       <span class="hint" id="selCount">0 selected</span>
       <div class="spacer"></div>
       <button type="button" onclick="enhanceSelected('${name}')">✦ Enhance selected</button>
+      <input id="autoclipSeconds" type="number" min="0.5" step="0.5" value="3" style="max-width:64px" title="Clip length in seconds">
+      <button type="button" onclick="autoclipVideos('${name}')">✂ Autoclip videos</button>
       <a href="/api/datasets/${encodeURIComponent(name)}/export?t=${encodeURIComponent(TOKEN)}" download="${name}.zip"><button type="button">⬇ Export ZIP</button></a>
       <button type="button" class="primary" onclick="saveAllCaptions('${name}')">Save dataset</button></div>
     <div class="enh-panel" id="enhancePanel">
@@ -892,6 +894,27 @@ async function applyTrim(onDone){
     toast('Trim failed: '+e.message);
     btn.disabled = false; btn.textContent = 'Apply trim';
   }
+}
+
+async function autoclipVideos(name){
+  const clip_seconds = parseFloat($('#autoclipSeconds')?.value) || 3;
+  const selectedVideos = [...document.querySelectorAll('#dsgrid .selchk:checked')]
+    .map(el => el.dataset.image)
+    .filter(img => _dsItemsCache.find(it => it.image === img)?.is_video);
+  let videos = selectedVideos;
+  if (!videos.length){
+    const totalVideos = _dsItemsCache.filter(it => it.is_video).length;
+    if (!totalVideos){ toast('No videos in this dataset.'); return; }
+    if (!(await modalConfirm(`No videos selected: split all ${totalVideos} videos into ${clip_seconds}s clips?`))) return;
+    videos = null; // null tells the backend to use every video in the dataset
+  }
+  try{
+    const result = await post(`/api/datasets/${encodeURIComponent(name)}/autoclip`, {videos, clip_seconds});
+    let msg = `Autoclipped ${result.videos_processed} video(s) into ${result.clips_created} clips.`;
+    if (result.skipped.length) msg += ` Skipped ${result.skipped.length} (too short or not found).`;
+    toast(msg);
+    renderItems(name);
+  }catch(e){ toast('Autoclip failed: '+e.message); }
 }
 
 function updateSelCount(){
