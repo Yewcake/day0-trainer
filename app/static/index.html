@@ -942,7 +942,11 @@ async function autoclipSmart(name){
   const stat = $('#smartClipStat');
   smartClipTimer = setInterval(async ()=>{
     const s = await api(`/api/datasets/${encodeURIComponent(name)}/autoclip/smart-status`);
-    if (stat) stat.textContent = `${s.status} ${s.done||0}/${s.total||0}` + (s.errors?.length ? ` · ${s.errors.length} errors` : '');
+    if (stat){
+      const running = !['finished','cancelled','idle'].includes(s.status);
+      stat.innerHTML = `${s.status} ${s.done||0}/${s.total||0}` + (s.errors?.length ? ` · ${s.errors.length} errors` : '') +
+        (running ? ` <a href="#" onclick="cancelAutoclipSmart('${name}');return false">cancel</a>` : '');
+    }
     if (['finished','cancelled','idle'].includes(s.status)){
       clearInterval(smartClipTimer);
       renderItems(name);
@@ -951,6 +955,8 @@ async function autoclipSmart(name){
     }
   }, 2500);
 }
+
+async function cancelAutoclipSmart(name){ await post(`/api/datasets/${encodeURIComponent(name)}/autoclip/smart-cancel`); }
 
 function updateSelCount(){
   const boxes = [...document.querySelectorAll('#dsgrid .selchk')];

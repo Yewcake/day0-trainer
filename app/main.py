@@ -703,13 +703,22 @@ SMART_CLIP_INSTRUCTION_TEMPLATE = (
 
 
 def _parse_gemini_json_array(text: str) -> list:
-    # Gemini sometimes wraps JSON in ```json ... ``` fences despite being told not to.
+    # Gemini sometimes wraps JSON in ```json ... ``` fences, or adds a stray sentence before/after
+    # the array, despite being told to return only JSON -- strip fences first, then fall back to
+    # slicing out the first [...] substring rather than failing the whole video on a format slip.
     text = text.strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1]
         if text.startswith("json"):
             text = text[4:]
-    return json.loads(text)
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            raise
+        return json.loads(text[start:end + 1])
 
 
 def _write_smart_caption(path: Path, caption: str, trigger: str) -> None:
