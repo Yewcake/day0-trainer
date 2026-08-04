@@ -1311,7 +1311,7 @@ def create_job(payload: dict) -> dict:
         "weight_decay": 0.01, "lokr_decompose_both": 0,
         "validation_image": "", "validation_prompt": "", "auto_analyze": False,
         "masterchef_enabled": False, "include_text_fusion": False,
-        "partition": "FL2VA", "num_frames": 73,
+        "partition": "FL2VA", "num_frames": 73, "short_edge": 768,
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -1359,6 +1359,7 @@ def create_job(payload: dict) -> dict:
             "--run_name", "run",
             "--trigger_word", trigger,
             "--num_frames", str(config["num_frames"]),
+            "--short_edge", str(config["short_edge"]),
             "--max_train_steps", str(config["steps"]),
             "--save_every_n_steps", str(config["save_every"]),
             "--rank", str(rank), "--lora_alpha", str(rank),

@@ -161,6 +161,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", default="run")
     parser.add_argument("--trigger_word", default="")
     parser.add_argument("--num_frames", type=int, default=73)  # ~3s @ 24fps; aligned to 17n+5 at load time
+    # diffusers' resolve_canvas_size() hardcodes a 768px short edge (matching the released model's
+    # default inference resolution). Lower values shrink the packed sequence length -- fewer spatial
+    # patches per frame -- for meaningfully faster caching and training steps, at the cost of training
+    # away from the model's native resolution. 768 (the default) reproduces the original hardcoded
+    # behavior exactly; anything else overrides it via a module-level constant patch, see main().
+    parser.add_argument("--short_edge", type=int, default=768)
     parser.add_argument("--max_train_steps", type=int, default=2000)
     parser.add_argument("--save_every_n_steps", type=int, default=250)
     parser.add_argument("--rank", type=int, default=32)
@@ -489,12 +495,25 @@ def main() -> None:
         )
 
     import torch
+    from diffusers.modular_pipelines.minimax_h3 import packing as h3_packing
     from diffusers.modular_pipelines.minimax_h3.packing import (
         build_packed_sequence,
         build_row_timesteps,
         patchify_video_latents,
         resolve_canvas_size,
     )
+
+    if args.short_edge != h3_packing.MINIMAX_H3_SHORT_EDGE:
+        # resolve_canvas_size() reads these as plain module globals at call time (not captured at
+        # import time), so patching them on the module object here changes its behavior for every
+        # call below without needing to reimplement its aspect-ratio/multiple-of-32 rounding logic.
+        # MAX_PIXELS is scaled by the same squared ratio so the extreme-aspect-ratio area cap stays
+        # proportional to the new short edge instead of becoming irrelevant (too high) or clipping
+        # normal aspect ratios (too low).
+        scale = (args.short_edge / h3_packing.MINIMAX_H3_SHORT_EDGE) ** 2
+        h3_packing.MINIMAX_H3_MAX_PIXELS = int(h3_packing.MINIMAX_H3_MAX_PIXELS * scale)
+        h3_packing.MINIMAX_H3_SHORT_EDGE = args.short_edge
+        say(f"Overriding MiniMax-H3 canvas short edge to {args.short_edge}px (model default 768px).")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
