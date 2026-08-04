@@ -530,6 +530,65 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
     return cache
 
 
+def convert_lora_to_comfyui_native(lora_state_dict: dict) -> dict:
+    """Repackage a diffusers-shaped MiniMax-H3 LoRA into the shape ComfyUI's native support actually
+    loads, rather than a shape diffusers' own generic Attention class happens to use.
+
+    Confirmed live: a checkpoint saved with diffusers' key names (transformer_blocks.N.attn.to_q,
+    to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2) produced "lora key not loaded" for every single
+    key in ComfyUI, even after prefixing with "diffusion_model." -- because diffusers' port of
+    MiniMax-H3 restructured the architecture to fit its own reusable Attention/FeedForward classes:
+    it split what the original release (and ComfyUI's from-scratch reimplementation in
+    comfy/ldm/minimax/model.py, read directly, not assumed) keeps as ONE fused qkv_proj Linear per
+    block into three separate to_q/to_k/to_v Linears. ComfyUI's blocks.N.attn.qkv_proj has no
+    separate to_q/to_k/to_v parameter to match against at all, so no amount of renaming alone fixes
+    it -- confirmed by checking Krea 2's native ComfyUI model (comfy/ldm/krea2/model.py), which does
+    keep separate wq/wk/wv and has never hit this, so the split-vs-fused choice is architecture-
+    specific, not a general diffusers quirk.
+
+    Three independent rank-r LoRAs (to_q, to_k, to_v) become one exactly-equivalent rank-3r LoRA for
+    the fused layer: stack the three A matrices vertically, and build a block-diagonal B (zeros
+    everywhere except each B slotted into its own block). For the q-output rows of the fused layer,
+    only B_q's block is nonzero, so B_fused @ A_fused reduces to exactly B_q @ A_q there (and
+    likewise for k/v) -- nothing approximated, no information lost, just repackaged into a shape
+    ComfyUI's fused qkv_proj can actually load. out_proj/mlp.fc1/mlp.fc2 need only the name change,
+    diffusers didn't restructure those, just renamed them (confirmed against comfy/ldm/minimax/
+    model.py's DiTBlock: self.attn.out_proj, self.mlp.fc1, self.mlp.fc2, under self.blocks -- not
+    self.transformer_blocks, that name doesn't exist on ComfyUI's side either)."""
+    import re
+    import torch
+
+    RENAME = {"attn.to_out.0": "attn.out_proj", "ff.net.0.proj": "mlp.fc1", "ff.net.2": "mlp.fc2"}
+    QKV_PARTS = ("attn.to_q", "attn.to_k", "attn.to_v")
+
+    qkv_parts: dict[int, dict[tuple[str, str], "torch.Tensor"]] = {}
+    out: dict[str, "torch.Tensor"] = {}
+    for key, tensor in lora_state_dict.items():
+        m = re.match(r"transformer_blocks\.(\d+)\.(.+)$", key)
+        if not m:
+            out[key] = tensor  # nothing in this trainer's target list should hit this, kept as a safety net
+            continue
+        block_idx, rest = int(m.group(1)), m.group(2)
+        matched_qkv = next((p for p in QKV_PARTS if rest.startswith(p)), None)
+        if matched_qkv:
+            suffix = rest[len(matched_qkv):]  # ".lora_A.weight" or ".lora_B.weight"
+            qkv_parts.setdefault(block_idx, {})[(matched_qkv, suffix)] = tensor
+            continue
+        renamed = rest
+        for old, new in RENAME.items():
+            if rest.startswith(old):
+                renamed = new + rest[len(old):]
+                break
+        out[f"blocks.{block_idx}.{renamed}"] = tensor
+
+    for block_idx, parts in qkv_parts.items():
+        a_q, a_k, a_v = (parts[(p, ".lora_A.weight")] for p in QKV_PARTS)
+        b_q, b_k, b_v = (parts[(p, ".lora_B.weight")] for p in QKV_PARTS)
+        out[f"blocks.{block_idx}.attn.qkv_proj.lora_A.weight"] = torch.cat([a_q, a_k, a_v], dim=0)
+        out[f"blocks.{block_idx}.attn.qkv_proj.lora_B.weight"] = torch.block_diag(b_q, b_k, b_v)
+    return out
+
+
 def main() -> None:
     setup_environment()
     args = parse_args()
@@ -734,14 +793,14 @@ def main() -> None:
             ckpt_dir = checkpoints_dir / f"step-{global_step:06d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             lora_state_dict = get_peft_model_state_dict(transformer, adapter_name="default")
-            # get_peft_model_state_dict() returns bare keys (transformer_blocks.N....lora_A.weight)
-            # reflecting the transformer module's own internal structure -- but ComfyUI's MiniMax-H3
-            # LoRA loader expects the original released checkpoint's top-level layout, which prefixes
-            # every transformer key with "diffusion_model." (confirmed against ai-toolkit's own
-            # working save path for this exact model/loader combination, same remap). Without this,
-            # every single key silently fails to match on load ("lora key not loaded") and the LoRA
-            # is a complete no-op at inference despite training and saving without any error --
-            # live-confirmed via a user's ComfyUI console log, not theoretical.
+            # get_peft_model_state_dict() returns diffusers-shaped keys (transformer_blocks.N.attn.
+            # to_q/to_k/to_v, separate Linears) -- but ComfyUI's native MiniMax-H3 support targets the
+            # original release's fused-qkv_proj layout instead (see convert_lora_to_comfyui_native()'s
+            # docstring for the live-confirmed why). A prefix rename alone isn't enough here, unlike
+            # the other two trainers -- this one needs the actual per-block QKV repackaging.
+            lora_state_dict = convert_lora_to_comfyui_native(lora_state_dict)
+            # ComfyUI's own top-level convention for every model's DiT weights, confirmed by the
+            # earlier "diffusion_model." prefix already being recognized (just not matched past it).
             lora_state_dict = {f"diffusion_model.{k}": v for k, v in lora_state_dict.items()}
             # Filename matches the cross-trainer convention app/main.py's job_checkpoints()/
             # download_checkpoint() already hardcode (Ideogram4's trainer follows the same
