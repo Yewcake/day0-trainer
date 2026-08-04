@@ -23,11 +23,14 @@ upstream's own tested code for all of it and only writes the pieces diffusers
 does not ship: a training loop, a dataset, and LoRA injection + checkpointing.
 
 WHAT THIS FIRST DRAFT DELIBERATELY DOES NOT DO
-- No Ref2VA / keyframe-conditioned training (reference-image-anchored LoRAs).
-  Plain T2VA only: text prompt -> video (+ optionally audio). MiniMax-H3's own
-  Ref2VA input mode already covers "keep this character consistent" at
-  inference time via reference images, which is why this first pass targets
-  style/motion LoRAs (the thing Ref2VA can't do) rather than identity LoRAs.
+- Ref2VA reference conditioning uses each clip's own first frame as its
+  reference (see precompute_cache()/main()'s reference-row handling) --
+  a practical proxy for "a reference photo of this subject", not textbook
+  Ref2VA usage (a genuinely separate reference image per clip). Good enough
+  to actually exercise the conditioning pathway those weights expect instead
+  of training them as if they were plain FL2VA, but a real multi-reference
+  dataset format (separate reference images, not just first-frame-of-clip)
+  is future work, not done here.
 - No audio training by default (`--train_audio 0`). The stated first targets
   (NSFW, yoga, cartoon) are visual styles, not audio concepts, and skipping
   audio means skipping the whole audio-VAE/waveform-extraction path entirely
@@ -152,9 +155,14 @@ def parse_args() -> argparse.Namespace:
     # plain text-to-video and first/last-keyframe-conditioned generation) and "ref2va" (reference-image/
     # video-conditioned generation, MiniMax-H3's native identity-consistency mechanism). Same
     # architecture and config, different weights -- a LoRA trained against one partition's transformer
-    # is not a drop-in adapter for the other. Style/motion LoRAs (this script's target use case) belong
-    # on fl2va; a future identity/character LoRA, if ever needed despite Ref2VA's native reference
-    # conditioning, would target ref2va instead.
+    # is not a drop-in adapter for the other (confirmed live: a checkpoint's key names alone match
+    # either partition's naming, but the actual weight values it perturbs are partition-specific, so
+    # testing a ref2va-trained LoRA against fl2va weights is a no-op, not a weaker effect). Selecting
+    # "Ref2VA" here automatically trains with first-frame reference conditioning (see main()'s
+    # reference-row handling) rather than plain T2VA on ref2va's weights -- the earlier version of
+    # this script trained those weights without ever exercising the conditioning pathway they expect,
+    # a real gap independent of the checkpoint key-prefix bug that turned out to be the actual cause
+    # of the first "LoRA has no effect" report (see the checkpoint-save code below).
     parser.add_argument("--partition", default="FL2VA", choices=["FL2VA", "Ref2VA"])
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -458,11 +466,18 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
     two frozen, ~10-65GB-each models every single step would be pure waste even with infinite VRAM --
     and freeing them afterwards (see main()) is what makes a single 80GB GPU realistic at all."""
     import torch
+    from diffusers.modular_pipelines.minimax_h3.packing import MINIMAX_H3_KEYFRAME_ENCODE_SEED
 
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1, 1)
     latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
     latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+    # Ref2VA's weights expect a reference-image condition; training them exactly like FL2VA's plain
+    # text-to-video (no reference at all) leaves that pathway completely unexercised. Uses each
+    # clip's own first frame as its reference -- the simplest available proxy for "a reference photo
+    # of this subject" (see main()'s module docstring for why this is an approximation, not textbook
+    # Ref2VA usage, and how it could extend to real separate reference images later).
+    use_reference = args.partition == "Ref2VA"
 
     cache = []
     with torch.no_grad():
@@ -472,6 +487,19 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
             video_latents = vae.encode(vae_input).latent_dist.sample()
             video_latents = (video_latents - latents_mean) / latents_std
 
+            reference_latents = None
+            if use_reference:
+                # The released model's own recipe: a seeded posterior sample (seed 42, independent of
+                # the training seed) of just the first frame, rounded to fp16 before normalizing, so
+                # the same source frame always yields the same clean reference latent regardless of
+                # which random noise/timestep a given training step happens to draw. How this gets
+                # noised into the packed sequence at train time lives in main(), not here -- this is
+                # only the clean, cacheable half of it.
+                ref_generator = torch.Generator(device="cpu").manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                reference_latents = vae.encode(vae_input[:, :, 0:1]).latent_dist.sample(generator=ref_generator)
+                reference_latents = reference_latents.to(torch.float16).to(torch.float32)
+                reference_latents = (reference_latents - latents_mean) / latents_std
+
             full_caption = f"{args.trigger_word}, {caption}" if args.trigger_word and args.trigger_word not in caption else caption
             text_ids = tokenizer([full_caption], return_tensors="pt", truncation=True).to(device)
             text_out = text_encoder.model(
@@ -480,7 +508,10 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
             )
             text_embeds = text_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
 
-            cache.append((video_latents.cpu(), text_embeds.cpu()))
+            cache.append((
+                video_latents.cpu(), text_embeds.cpu(),
+                reference_latents.cpu() if reference_latents is not None else None,
+            ))
             say(f"Cached {i + 1}/{len(clips)}: {path.name}")
     return cache
 
@@ -565,7 +596,7 @@ def main() -> None:
         step_start = time.time()
         if global_step % len(cache) == 0:
             random.shuffle(order)
-        video_latents, text_embeds = cache[order[global_step % len(cache)]]
+        video_latents, text_embeds, reference_latents = cache[order[global_step % len(cache)]]
         video_latents = video_latents.to(device)
         text_embeds = text_embeds.to(device, dtype=torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16)
         text_token_tags = torch.ones(text_embeds.shape[1], dtype=torch.long)  # 1 = text (no keyframe vision blocks)
@@ -573,6 +604,12 @@ def main() -> None:
         batch_size = video_latents.shape[0]
         patch_size = transformer.config.patch_size
         _, _, num_latent_frames, latent_height, latent_width = video_latents.shape
+
+        # A cached reference latent means this clip was cached under --partition Ref2VA (see
+        # precompute_cache()) -- those weights expect a reference-image condition, so keyframe_anchors
+        # gets one "first" entry and the packed sequence gains condition rows ahead of the target video
+        # rows. FL2VA clips have no cached reference and train exactly as before (plain T2VA).
+        has_reference = reference_latents is not None
 
         # num_audio_latents=0 -> no audio rows at all in the packed sequence (not silence, just absent).
         # --train_audio always raises in load_encoders() before reaching here -- see that function's
@@ -584,7 +621,7 @@ def main() -> None:
             latent_width=latent_width,
             num_audio_latents=0,
             patch_size=patch_size,
-            keyframe_anchors=(),  # plain T2VA, no reference/keyframe conditioning -- see module docstring
+            keyframe_anchors=("first",) if has_reference else (),
         )
 
         noise = torch.randn_like(video_latents)
@@ -601,11 +638,26 @@ def main() -> None:
         # 1 here, restoring the batch dim is just unsqueeze(0), not a general reshape.
         noisy_video_rows = patchify_video_latents(noisy_video, patch_size).unsqueeze(0)
         target_video_rows = patchify_video_latents(video_target, patch_size).unsqueeze(0)
+
+        # Condition rows go in front of the target rows (build_packed_sequence's own layout order:
+        # "keyframe conditioning rows first, then the target rows"). The released model's recipe noises
+        # them to a fixed, mostly-clean t=0.999 (MINIMAX_H3_KEYFRAME_NOISE_AUG) every step, not the
+        # per-step random sigma the actual generation target gets -- the reference is meant to arrive
+        # nearly-clean regardless of how noisy this step's generation target is.
+        condition_video_t = video_t
+        if has_reference:
+            reference_latents = reference_latents.to(device)
+            condition_video_t = h3_packing.MINIMAX_H3_KEYFRAME_NOISE_AUG
+            ref_noise = torch.randn_like(reference_latents)
+            noisy_reference = video_scheduler.scale_noise(reference_latents, condition_video_t, ref_noise)
+            condition_rows = patchify_video_latents(noisy_reference, patch_size).unsqueeze(0)
+            noisy_video_rows = torch.cat([condition_rows, noisy_video_rows], dim=1)
+
         empty_audio_rows = torch.zeros(batch_size, 0, transformer.config.audio_in_channels, device=device)
 
         timesteps, timestep_indices = build_row_timesteps(
             layout, video_timestep=video_t, audio_timestep=video_t,
-            condition_video_timestep=video_t, condition_audio_timestep=video_t,
+            condition_video_timestep=condition_video_t, condition_audio_timestep=video_t,
         )
 
         output = transformer(
@@ -621,7 +673,11 @@ def main() -> None:
             text_indices=layout.text_indices.to(device),
         )
 
-        loss = torch.nn.functional.mse_loss(output.sample.float(), target_video_rows.float())
+        # Condition-row predictions aren't something we're teaching the model to generate -- they're
+        # the given context -- so they get dropped before computing loss against the real target,
+        # matching layout.num_condition_video_rows exactly (0 when there's no reference, a no-op slice).
+        output_sample = output.sample[:, layout.num_condition_video_rows:]
+        loss = torch.nn.functional.mse_loss(output_sample.float(), target_video_rows.float())
 
         loss.backward()
         optimizer.step()
