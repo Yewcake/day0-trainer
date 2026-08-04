@@ -466,6 +466,7 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
     two frozen, ~10-65GB-each models every single step would be pure waste even with infinite VRAM --
     and freeing them afterwards (see main()) is what makes a single 80GB GPU realistic at all."""
     import torch
+    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
     from diffusers.modular_pipelines.minimax_h3.packing import MINIMAX_H3_KEYFRAME_ENCODE_SEED
 
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1, 1)
@@ -495,8 +496,21 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
                 # which random noise/timestep a given training step happens to draw. How this gets
                 # noised into the packed sequence at train time lives in main(), not here -- this is
                 # only the clean, cacheable half of it.
+                #
+                # NOT vae.encode() -- confirmed live: that goes through _encode()'s 17-frame chunking
+                # (clip_length/token_drop), which is wrong for a lone frame and silently produced 2
+                # latent frames instead of 1, desyncing the condition-row count build_packed_sequence()
+                # expects from the row count actually concatenated onto hidden_states
+                # (index_copy_(): Number of indices (5796) should be equal to source.size(dim) (6048),
+                # the 252-row gap being exactly one extra rows_per_frame). The real diffusers source
+                # says why directly: "MiniMax-H3 encodes a keyframe or an image reference through
+                # [_encode_clip] rather than through [encode], because a single frame must not go
+                # through the temporal chunking." _encode_clip() returns raw moments, so the
+                # DiagonalGaussianDistribution wrapping (and the generator-seeded .sample() on it) is
+                # done by hand here, mirroring exactly what encode() itself does internally.
                 ref_generator = torch.Generator(device="cpu").manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                reference_latents = vae.encode(vae_input[:, :, 0:1]).latent_dist.sample(generator=ref_generator)
+                ref_moments = vae._encode_clip(vae_input[:, :, 0:1])
+                reference_latents = DiagonalGaussianDistribution(ref_moments).sample(generator=ref_generator)
                 reference_latents = reference_latents.to(torch.float16).to(torch.float32)
                 reference_latents = (reference_latents - latents_mean) / latents_std
 
