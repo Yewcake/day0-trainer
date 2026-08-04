@@ -664,6 +664,15 @@ def main() -> None:
             ckpt_dir = checkpoints_dir / f"step-{global_step:06d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             lora_state_dict = get_peft_model_state_dict(transformer, adapter_name="default")
+            # get_peft_model_state_dict() returns bare keys (transformer_blocks.N....lora_A.weight)
+            # reflecting the transformer module's own internal structure -- but ComfyUI's MiniMax-H3
+            # LoRA loader expects the original released checkpoint's top-level layout, which prefixes
+            # every transformer key with "diffusion_model." (confirmed against ai-toolkit's own
+            # working save path for this exact model/loader combination, same remap). Without this,
+            # every single key silently fails to match on load ("lora key not loaded") and the LoRA
+            # is a complete no-op at inference despite training and saving without any error --
+            # live-confirmed via a user's ComfyUI console log, not theoretical.
+            lora_state_dict = {f"diffusion_model.{k}": v for k, v in lora_state_dict.items()}
             # Filename matches the cross-trainer convention app/main.py's job_checkpoints()/
             # download_checkpoint() already hardcode (Ideogram4's trainer follows the same
             # convention for the same reason) -- not because H3 is Krea2, just so the existing
