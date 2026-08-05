@@ -496,7 +496,7 @@ const PROVEN_SETTINGS = {
   },
   lokr: {
     f_rank: '32', f_factor: '4', f_fullrank: '1', f_decompose: '0', f_res: '1024',
-    f_optimizer: 'automagic', f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
+    f_optimizer: 'automagic', f_lr: '5e-5', f_wd: '0.01', f_gc: '1',
   },
 };
 const LOCKED_FIELD_IDS = ['f_rank','f_factor','f_fullrank','f_decompose','f_res','f_optimizer','f_lr','f_wd','f_gc'];
@@ -1361,6 +1361,18 @@ async function deleteJob(id){
 
 function ema(values, alpha=0.06){ const out=[]; let prev=values[0]; for(const v of values){ prev=alpha*v+(1-alpha)*prev; out.push(prev);} return out; }
 
+// Linear-interpolated percentile, used instead of Math.min/max for the chart's y-axis range --
+// plain min/max lets a single outlier (notably smooth[0], the EMA's very first point, which
+// equals the raw loss at step 1 with zero smoothing applied yet) stretch the whole axis and
+// squash everything after it into a sliver near the bottom.
+function percentile(values, p){
+  const sorted = values.filter(v => v != null && !isNaN(v)).sort((a,b) => a-b);
+  if (!sorted.length) return 0;
+  const idx = (sorted.length - 1) * p / 100;
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
 // Rolling min/max over a recent window of raw (noisy) loss values -- lets the chart show
 // spike amplitude shrinking over a run, which is the visible signature of a cosine schedule
 // actually converging (vs. a flat/non-shrinking band, which flags LR not decaying enough).
@@ -1391,13 +1403,18 @@ async function drawMetrics(id){
   const lrPoints = pts.map((p,i)=>({i, v:p.lr})).filter(p=>p.v!=null && !isNaN(p.v));
   const LR_COLOR = '#4aa8e6';
   const pad = {l:46, r: lrPoints.length ? 54 : 10, t:12, b:22};
-  // Scale the y-axis to the EMA trend (+ val_loss), not raw per-step loss -- raw loss spikes
-  // (single-image batches, random timesteps) used to stretch the axis so far that the actual
-  // decline got compressed into a sliver near the bottom. Raw loss/envelope still draw at full
-  // amplitude and simply clip at the edges when they spike past this range, which is correct:
-  // the EMA line is the trend that should fill the chart.
-  const trendSource = smooth.concat(valPoints.map(p=>p.v));
-  let lo = Math.min(...trendSource), hi = Math.max(...trendSource);
+  // Scale the y-axis to a percentile-trimmed range of EMA + val_loss + raw loss combined, not a
+  // plain min/max of just the EMA trend. Plain-min/max-of-EMA-only had two problems: (1) smooth[0]
+  // (the EMA's first point) equals the raw loss at step 1 exactly, with zero smoothing applied yet
+  // -- if that happens to be near the run's peak loss, the axis stretches to fit that ONE point and
+  // everything after it gets squashed into a sliver near the bottom; (2) raw loss spikes were
+  // excluded from the range entirely and just clipped at the edges, so the actual spikiness of
+  // training (useful signal -- e.g. spike amplitude shrinking as the LR schedule converges) was
+  // barely visible. Trimming to the 2nd-98th percentile of all three combined keeps a few genuine
+  // outliers from blowing out the scale (the original min/max-of-everything failure mode) while
+  // giving spikes real vertical room instead of clipping them away.
+  const trendSource = smooth.concat(valPoints.map(p=>p.v), loss);
+  let lo = percentile(trendSource, 2), hi = percentile(trendSource, 98);
   const span = (hi - lo) || (hi * 0.1) || 1;
   lo = Math.max(0, lo - span * 0.08);
   hi = hi + span * 0.08;
@@ -1435,7 +1452,7 @@ async function drawMetrics(id){
     ctx.closePath();
     ctx.fillStyle = css('--accent'); ctx.globalAlpha = 0.12; ctx.fill(); ctx.globalAlpha = 1;
   }
-  ctx.strokeStyle = css('--muted'); ctx.globalAlpha = 0.35; ctx.beginPath();
+  ctx.strokeStyle = css('--muted'); ctx.globalAlpha = 0.55; ctx.beginPath();
   loss.forEach((v,i)=> i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v))); ctx.stroke(); ctx.globalAlpha = 1;
   ctx.lineWidth=2; ctx.strokeStyle = css('--accent'); ctx.beginPath();
   smooth.forEach((v,i)=> i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v))); ctx.stroke();
