@@ -481,6 +481,17 @@ def load_transformer(args, device):
     # when only int8 was supported) -- same skip list, same reasoning: none of those modules do the
     # weight.dtype self-referential cast, so quantizing them wasn't unsafe, just previously unhelpful
     # to change without knowing whether it'd be enough.
+    #
+    # token_refiner added here after cross-checking ai-toolkit's own MiniMax-H3 extension's
+    # get_quantization_exclude_modules() line by line against this list (every other name matches
+    # 1:1 once accounting for diffusers-vs-native naming -- video_patch_proj/audio_patch_proj =
+    # proj_in/audio_proj_in, condition_proj = context_embedder, final_layer = proj_out+norm_out --
+    # confirmed against the real diffusers __init__ attribute names, not assumed). token_refiner was
+    # the one real gap: it's a LoRA target here (inject_lora() trains token_refiner.refiner_blocks.*)
+    # but wasn't excluded from quantization, meaning that LoRA was being trained against a quantized
+    # frozen base while ai-toolkit trains it against a full-precision one. token_refiner preprocesses
+    # every text token before it ever reaches the main transformer_blocks, so a noisier frozen base
+    # there has more reach than a typical single attention/FF layer would.
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -488,7 +499,7 @@ def load_transformer(args, device):
         bnb_4bit_compute_dtype=dtype,
         llm_int8_skip_modules=[
             "proj_in", "audio_proj_in", "context_embedder", "time_embedder",
-            "proj_out", "audio_proj_out", "adaln_proj", "norm_out", "rope",
+            "proj_out", "audio_proj_out", "adaln_proj", "norm_out", "rope", "token_refiner",
         ],
     ) if args.quantize_base else None
     transformer = MiniMaxH3Transformer3DModel.from_pretrained(
