@@ -317,6 +317,10 @@ async function showTrain(){
       <option value="FL2VA" selected>FL2VA — plain text/image-to-video (no reference identity)</option>
       <option value="Ref2VA">Ref2VA — reference-image-conditioned (use with a subject's reference images)</option>
     </select></div>
+    <div class="row" id="row-h3-quantsource" style="display:none"><label>Base checkpoint</label><select id="f_quantsource">
+      <option value="bitsandbytes" selected>Self-quantized NF4 (download full model, quantize ourselves)</option>
+      <option value="comfy_convrot">Comfy-Org int8-ConvRot (matches ComfyUI's own checkpoint, smaller LoRA more likely to match community checkpoints)</option>
+    </select></div>
     <div class="row" id="row-h3-frames" style="display:none"><label>Clip length</label>
       <select id="f_numframes">
         <option value="22">~1s (22 frames)</option>
@@ -408,7 +412,7 @@ function onModelChange(){
     if (tf) tf.checked = false;
   }
 
-  ['row-h3-partition', 'row-h3-frames', 'row-h3-shortedge', 'row-h3-audio'].forEach(id => { const el = $('#'+id); if (el) el.style.display = isH3 ? '' : 'none'; });
+  ['row-h3-partition', 'row-h3-quantsource', 'row-h3-frames', 'row-h3-shortedge', 'row-h3-audio'].forEach(id => { const el = $('#'+id); if (el) el.style.display = isH3 ? '' : 'none'; });
   ['row-resolution', 'row-optimizer', 'row-sample-every', 'row-sample-prompts',
    'row-autoanalyze', 'row-valimage', 'row-valprompt'].forEach(id => {
     const el = $('#'+id); if (el) el.style.display = isH3 ? 'none' : '';
@@ -555,7 +559,8 @@ async function submitJob(ev){
     auto_analyze: $('#f_autoanalyze').checked,
     masterchef_enabled: $('#f_masterchef').checked,
     include_text_fusion: $('#f_include_text_fusion').checked,
-    partition: $('#f_partition').value, num_frames:+$('#f_numframes').value,
+    partition: $('#f_partition').value, quant_source: $('#f_quantsource')?.value || 'bitsandbytes',
+    num_frames:+$('#f_numframes').value,
     short_edge:+$('#f_shortedge').value,
     train_audio: $('#f_trainaudio')?.checked || false,
     sample_prompts: prompts,

@@ -107,6 +107,24 @@ MINIMAX_H3_TEXT_ENCODER_LAYER = 50
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 
+# Comfy-Org's own pre-quantized MiniMax-H3 release. Deliberately the NON-pruned int8-ConvRot
+# file, not "*_pruned_int8_convrot" -- confirmed by inspecting both files' real safetensors
+# headers (byte-range HTTP requests, not assumed): the pruned variant replaces adaln_proj's
+# input with an 8-dim "adaln_t_table" lookup (fed by a precomputed [1025, 8] curve buffer)
+# instead of the full model's normal 2688-dim TimestepEmbedding-MLP conditioning -- a genuinely
+# different computation graph, not just different quantization, that would require reimplementing
+# MiniMax-H3's forward pass by hand (ComfyUI's own comfy/ldm/minimax/model.py) to use correctly.
+# The non-pruned convrot file's adaln_proj is still 2688-dim (verified: blocks.0.adaln_proj.
+# linear.weight is [96768, 2688], int8-quantized, and time_embedder.proj_in/proj_out are present
+# with their normal shapes) -- same computation graph as the full model, just int8-quantized, so
+# it loads into diffusers' existing, unmodified MiniMaxH3Transformer3DModel with zero forward-pass
+# changes needed.
+MINIMAX_H3_CONVROT_REPO = "Comfy-Org/MiniMax-H3"
+MINIMAX_H3_CONVROT_FILES = {
+    "FL2VA": "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
+    "Ref2VA": "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors",
+}
+
 
 def say(msg: str) -> None:
     print(f"[minimax-h3-trainer] {msg}", flush=True)
@@ -203,6 +221,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio_loss_weight", type=float, default=1.0)  # matches ss_h3_audio_loss_weight: 1 convention
     parser.add_argument("--base_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--quantize_base", type=int, default=1)  # 4-bit (nf4) frozen base; ~33B model, LoRA-only fits nothing else
+    # "bitsandbytes" (default): download the full model ourselves, quantize to NF4 at load time
+    # (load_transformer()) -- --quantize_base governs this path. "comfy_convrot": download
+    # Comfy-Org's own pre-quantized int8-ConvRot checkpoint instead (load_transformer_convrot()),
+    # ignoring --quantize_base entirely (that checkpoint is already quantized, there's no
+    # "unquantized" variant of it to fall back to). Matches what real community LoRAs (and
+    # ai-toolkit's own default recipe) actually target, and produces a checkpoint that loads
+    # cleanly against ComfyUI's own int8-ConvRot checkpoint without any shape mismatch.
+    parser.add_argument("--quant_source", default="bitsandbytes", choices=["bitsandbytes", "comfy_convrot"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--caption_extension", default=".txt")
     return parser.parse_args()
@@ -436,6 +462,109 @@ def load_encoders(args, device):
     return vae, text_encoder, tokenizer, video_scheduler, audio_vae
 
 
+# --------------------------------------------------------------------------
+# ConvRot int8 dequantization -- for loading Comfy-Org's pre-quantized checkpoint
+# (see load_transformer_convrot() below). Algorithm read directly from ai-toolkit's real
+# source (toolkit/util/convrot_quant.py's ConvRotInt8Quantizer, toolkit/util/
+# comfy_quant_import.py's import_comfy_quantized_layers()), not guessed or reverse-engineered
+# from behavior -- this is the same rotate-then-quantize-then-derotate scheme QuaRot/SpinQuant
+# use to reduce int8 outlier error, applied per output row:
+#   quantize:   q, scale = int8_per_row(rotate(w, rot_size))     -- rotate is a fixed, self-
+#   dequantize: w = rotate(q.float() * scale, rot_size)             inverse orthogonal transform
+# rotate()'s matrix is a Kronecker power of the 4x4 regular Hadamard matrix -- deterministic,
+# parameter-free, needs no data from the checkpoint beyond rot_size itself.
+# --------------------------------------------------------------------------
+_convrot_hadamard_cache: dict = {}
+
+
+def _convrot_hadamard(rot_size: int, device, dtype) -> "torch.Tensor":
+    import torch
+
+    key = (rot_size, str(device), dtype)
+    if key not in _convrot_hadamard_cache:
+        r4 = torch.tensor(
+            [[1.0, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+            dtype=torch.float32, device="cpu",
+        )
+        h = r4.clone()
+        while h.shape[0] < rot_size:
+            h = torch.kron(h, r4)
+        if h.shape[0] != rot_size:
+            raise ValueError(f"ConvRot rot_size {rot_size} is not a power of 4")
+        _convrot_hadamard_cache[key] = (h / rot_size**0.5).to(device=device, dtype=dtype)
+    return _convrot_hadamard_cache[key]
+
+
+def _convrot_rotate(x: "torch.Tensor", rot_size: int) -> "torch.Tensor":
+    """Block regular-Hadamard rotation along the last dim. Self-inverse -- applying this twice
+    returns the original tensor exactly (up to floating-point rounding), which is what makes
+    "rotate the already-rotated-and-dequantized int8 data" the correct way to undo it."""
+    import torch
+
+    if rot_size == 1:
+        return x
+    h = _convrot_hadamard(rot_size, x.device, x.dtype)
+    shape = x.shape
+    xb = x.reshape(-1, shape[-1] // rot_size, rot_size)
+    return torch.matmul(xb, h).reshape(shape)
+
+
+def _parse_comfy_quant_blob(blob: "torch.Tensor") -> dict:
+    """Comfy's own on-disk marker: a uint8 tensor holding UTF-8 JSON, e.g.
+    {"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}."""
+    import json
+
+    return json.loads(bytes(blob.cpu().tolist()).decode("utf-8"))
+
+
+def _dequantize_convrot_int8(
+    qdata: "torch.Tensor", scale: "torch.Tensor", rot_size: int, dtype
+) -> "torch.Tensor":
+    """qdata: int8 (out_features, in_features), the rotated weight's per-row-symmetric int8
+    codes. scale: per-output-row fp32 scale (out_features,) -- max(abs(rotated_row))/127 at
+    quantize time. Returns the dense, de-rotated weight in `dtype`."""
+    w_rotated = qdata.to(torch.float32) * scale.reshape(-1, 1).to(torch.float32)
+    return _convrot_rotate(w_rotated, rot_size).to(dtype)
+
+
+class ConvRotInt8Linear(torch.nn.Linear):
+    """A frozen int8-ConvRot-quantized Linear that dequantizes fresh on every forward call
+    under no_grad, instead of ai-toolkit's own QAT-capable custom-autograd machinery
+    (straight-through estimators, Triton kernels) -- that machinery exists so gradients CAN
+    flow into the quantized weights themselves for quantization-aware fine-tuning. We don't
+    need that: this is standard LoRA training, the base weight is frozen either way, and
+    PyTorch's autograd already backprops correctly through a plain F.linear w.r.t. the
+    *input* (what a LoRA adapter's gradient path actually needs) without any custom backward,
+    exactly like bitsandbytes' own Linear4bit/Linear8bitLt already do in this same trainer's
+    other loading path.
+
+    No real `.weight` Parameter is kept (mirrors ai-toolkit's own `_to_ostris()` pattern:
+    `del module._parameters["weight"]`) -- verified safe against real peft source before
+    relying on it, not assumed: LoraLayer.update_layer() (the code that creates lora_A/lora_B
+    for a target module) only reads `self.in_features`/`self.out_features` for sizing, and
+    only touches `base_layer.weight` inside the pissa/olora/loftq/corda init-scheme branches,
+    none of which this trainer uses (inject_lora() passes init_lora_weights="gaussian").
+    Forward delegation is `self.base_layer(x)` -- calls this class's own forward() directly,
+    never reads `.weight`. isinstance(module, torch.nn.Linear) is what inject_lora() checks to
+    build its target list, and this class satisfies that by real inheritance, not duck-typing."""
+
+    def __init__(self, qdata, scale, rot_size: int, bias, compute_dtype):
+        out_features, in_features = qdata.shape
+        super().__init__(in_features, out_features, bias=bias is not None, device="meta")
+        del self._parameters["weight"]
+        if bias is not None:
+            self.bias = torch.nn.Parameter(bias.to(compute_dtype), requires_grad=False)
+        self.register_buffer("cr8_qdata", qdata, persistent=False)
+        self.register_buffer("cr8_scale", scale.reshape(-1).to(torch.float32), persistent=False)
+        self.cr8_rot_size = rot_size
+        self.compute_dtype = compute_dtype
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        with torch.no_grad():
+            w = _dequantize_convrot_int8(self.cr8_qdata, self.cr8_scale, self.cr8_rot_size, self.compute_dtype)
+        return torch.nn.functional.linear(x, w, self.bias)
+
+
 def load_transformer(args, device):
     import torch
     from diffusers import MiniMaxH3Transformer3DModel
@@ -511,6 +640,287 @@ def load_transformer(args, device):
     )
     if not args.quantize_base:
         transformer = transformer.to(device)
+    transformer.requires_grad_(False)
+    if args.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+    return transformer
+
+
+# Diffusers attribute name -> Comfy-Org checkpoint key-prefix template, for every per-block
+# Linear except the fused attn.qkv_proj (handled separately below, since it splits into three).
+# Verified against real diffusers __init__ code for every entry (not assumed): attn.to_out.0=
+# out_proj, attn.norm_q/norm_k=q_norm/k_norm, ff.net.0.proj/net.2=mlp.fc1/fc2, norm1/norm2 match
+# by name already, adaln_proj.linear matches by name already.
+_CONVROT_BLOCK_LINEAR_MAP = {
+    "attn.to_out.0": "attn.out_proj",
+    "ff.net.0.proj": "mlp.fc1",
+    "ff.net.2": "mlp.fc2",
+    "adaln_proj.linear": "adaln_proj.linear",
+}
+_CONVROT_BLOCK_NORM_MAP = {
+    "norm1": "norm1", "norm2": "norm2",
+    "attn.norm_q": "attn.q_norm", "attn.norm_k": "attn.k_norm",
+}
+# Top-level (non-block) modules. norm_out/proj_out/audio_proj_out map to comfy's final_layer's
+# own norm/adaln_proj.linear/video_out/audio_out (verified: MiniMaxH3AdaLayerNormOut.linear is
+# Linear(2688, 10752), exactly matching AdalnProj(t_dim=2688, hidden=5376, expand=2,
+# modalities=1)'s Linear(2688, 2*5376*1=10752) -- same tensor, just unwrapped one level).
+_CONVROT_TOP_LINEAR_MAP = {
+    "proj_in": "video_patch_proj",
+    "audio_proj_in": "audio_patch_proj",
+    "context_embedder": "condition_proj",
+    "time_embedder.linear_1": "time_embedder.proj_in",
+    "time_embedder.linear_2": "time_embedder.proj_out",
+    "norm_out.linear": "final_layer.adaln_proj.linear",
+    "proj_out": "final_layer.video_out",
+    "audio_proj_out": "final_layer.audio_out",
+}
+_CONVROT_TOP_NORM_MAP = {"norm_out.norm": "final_layer.norm"}
+
+
+def load_transformer_convrot(args, device):
+    """Load MiniMax-H3 from Comfy-Org's own pre-quantized int8-ConvRot checkpoint instead of
+    downloading and self-quantizing the full model (see load_transformer()). Trades bitsandbytes
+    NF4 (this trainer's other path) for Comfy's own int8-ConvRot format on the attention/FFN
+    linears -- worse bits-per-parameter than NF4, but matches what the wider community actually
+    trains against (real ComfyUI checkpoints dissected earlier all target this format) and what
+    a LoRA saved from this trainer needs to shape-match to load cleanly in ComfyUI without the
+    block-diagonal QKV-fusion conversion silently producing a checkpoint that only loads against
+    a *different* base checkpoint than the one it was actually trained on.
+
+    Deliberately the non-pruned "*_int8_convrot" file, not "*_pruned_int8_convrot" -- confirmed
+    live (byte-range HTTP header reads against both real files) that the pruned variant replaces
+    adaln_proj's normal 2688-dim TimestepEmbedding-MLP conditioning with an 8-dim lookup-table
+    mechanism ("adaln_t_table"), a genuinely different computation graph this trainer does not
+    implement. The non-pruned file keeps the full model's exact architecture (verified: its
+    adaln_proj is still 2688-dim, time_embedder.proj_in/proj_out are present with normal shapes),
+    just int8-quantized -- loads into diffusers' unmodified MiniMaxH3Transformer3DModel.
+
+    adaln_proj is dequantized ONCE here and kept dense (not wrapped in the lazy per-forward
+    ConvRotInt8Linear used for attention/FFN) -- matches this trainer's own token_refiner
+    exclusion above and ai-toolkit's real exclude-list philosophy: keep the sensitive modulation
+    path's LoRA training against a clean, full-precision-equivalent base rather than one that's
+    re-quantized every forward pass.
+    """
+    import torch
+    from accelerate import init_empty_weights
+    from diffusers import MiniMaxH3Transformer3DModel
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+
+    dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
+    filename = MINIMAX_H3_CONVROT_FILES[args.partition]
+    say(f"Downloading Comfy-Org pre-quantized checkpoint ({filename})...")
+    ckpt_path = hf_hub_download(MINIMAX_H3_CONVROT_REPO, filename)
+
+    say("Building MiniMax-H3 transformer shell (defaults already match this checkpoint's "
+        "architecture, confirmed against its real header, not assumed)...")
+    with init_empty_weights():
+        transformer = MiniMaxH3Transformer3DModel()
+
+    f = safe_open(ckpt_path, framework="pt", device="cpu")
+    keys = set(f.keys())
+    consumed: set = set()
+
+    def take(key: str) -> "torch.Tensor":
+        consumed.add(key)
+        return f.get_tensor(key)
+
+    def has_quant_marker(prefix: str) -> bool:
+        return f"{prefix}.comfy_quant" in keys
+
+    def dequantize_dense(prefix: str, out_dtype) -> "torch.Tensor":
+        """For modules we deliberately keep dense (adaln_proj) even though the checkpoint
+        stores them quantized -- dequantize once here rather than wrapping in ConvRotInt8Linear."""
+        conf = _parse_comfy_quant_blob(take(f"{prefix}.comfy_quant"))
+        qdata = take(f"{prefix}.weight")
+        scale = take(f"{prefix}.weight_scale")
+        rot = int(conf.get("convrot_groupsize", 256)) if conf.get("convrot") else 1
+        return _dequantize_convrot_int8(qdata, scale, rot, out_dtype)
+
+    def set_param(module, attr: str, tensor: "torch.Tensor") -> None:
+        setattr(module, attr, torch.nn.Parameter(tensor.to(device=device), requires_grad=False))
+
+    def check_bias_matches(module_holder, attr: str, prefix: str) -> None:
+        """diffusers' own shell (built from its real __init__, just on the meta device) already
+        encodes whether each Linear expects a bias -- verify the checkpoint agrees instead of
+        silently trusting comfy's own bias=False convention carries over unchanged. A mismatch
+        here would mean a real trained bias getting silently dropped (checkpoint has one, shell
+        doesn't expect one) or a wrong bias=None replacing a real one (shell expects one, this
+        specific checkpoint variant doesn't have it) -- either way, worth failing loudly on."""
+        original = getattr(module_holder, attr)
+        expects_bias = original.bias is not None
+        has_bias = f"{prefix}.bias" in keys
+        if expects_bias != has_bias:
+            raise RuntimeError(
+                f"Bias mismatch loading {prefix}: diffusers' shell "
+                f"{'expects' if expects_bias else 'does not expect'} a bias, checkpoint "
+                f"{'has' if has_bias else 'has no'} '{prefix}.bias'. Aborting rather than "
+                "silently guessing which one is right."
+            )
+
+    def load_quantized_linear(module_holder, attr: str, prefix: str) -> None:
+        """Replace the meta-device nn.Linear at module_holder.<attr> with a lazy
+        ConvRotInt8Linear backed by this prefix's on-disk int8 codes."""
+        check_bias_matches(module_holder, attr, prefix)
+        conf = _parse_comfy_quant_blob(take(f"{prefix}.comfy_quant"))
+        qdata = take(f"{prefix}.weight").to(device)
+        scale = take(f"{prefix}.weight_scale").to(device)
+        bias_key = f"{prefix}.bias"
+        bias = take(bias_key).to(device) if bias_key in keys else None
+        rot = int(conf.get("convrot_groupsize", 256)) if conf.get("convrot") else 1
+        setattr(module_holder, attr, ConvRotInt8Linear(qdata, scale, rot, bias, dtype))
+
+    def load_dense_linear(module_holder, attr: str, prefix: str) -> None:
+        check_bias_matches(module_holder, attr, prefix)
+        weight = take(f"{prefix}.weight").to(device=device, dtype=dtype)
+        bias_key = f"{prefix}.bias"
+        linear = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=bias_key in keys)
+        set_param(linear, "weight", weight)
+        if bias_key in keys:
+            set_param(linear, "bias", take(bias_key).to(dtype=dtype))
+        setattr(module_holder, attr, linear)
+
+    def load_dequantized_dense_linear(module_holder, attr: str, prefix: str) -> None:
+        """For modules kept dense on purpose even though this checkpoint stores them quantized
+        (adaln_proj) -- dequantize once here rather than wrapping in ConvRotInt8Linear."""
+        check_bias_matches(module_holder, attr, prefix)
+        weight = dequantize_dense(prefix, dtype)
+        bias_key = f"{prefix}.bias"
+        linear = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=bias_key in keys)
+        set_param(linear, "weight", weight)
+        if bias_key in keys:
+            set_param(linear, "bias", take(bias_key).to(dtype=dtype))
+        setattr(module_holder, attr, linear)
+
+    def load_dense_norm(module, prefix: str) -> None:
+        set_param(module, "weight", take(f"{prefix}.weight").to(dtype=dtype))
+
+    def resolve(root, dotted: str):
+        obj = root
+        parts = dotted.split(".")
+        for p in parts[:-1]:
+            obj = getattr(obj, p)
+        return obj, parts[-1]
+
+    say("Populating boundary modules (video/audio patch-in, text conditioning, time embedder, "
+        "output heads)...")
+    for diffusers_name, comfy_prefix in _CONVROT_TOP_LINEAR_MAP.items():
+        holder, attr = resolve(transformer, diffusers_name)
+        if has_quant_marker(comfy_prefix):
+            # Kept dense on purpose (matches this trainer's own quantization-exclude philosophy
+            # for boundary modules, see load_transformer()'s own comment) even where the
+            # checkpoint itself quantized it (adaln_proj-adjacent final_layer weights do, here).
+            load_dequantized_dense_linear(holder, attr, comfy_prefix)
+        else:
+            load_dense_linear(holder, attr, comfy_prefix)
+    for diffusers_name, comfy_prefix in _CONVROT_TOP_NORM_MAP.items():
+        holder, attr = resolve(transformer, diffusers_name)
+        load_dense_norm(getattr(holder, attr), comfy_prefix)
+    # rope.inv_freq is a deterministic function of rope_freq_dim/rope_theta (both config, not
+    # checkpoint data) in diffusers -- confirmed real source computes it fresh, not from a stored
+    # buffer, so it's identical to the checkpoint's own buffer by construction and needs no load.
+
+    say(f"Populating {transformer.config.num_layers} transformer blocks (attention + FFN quantized, "
+        "adaln_proj kept dense)...")
+    for i, block in enumerate(transformer.transformer_blocks):
+        prefix = f"blocks.{i}"
+        # Fused qkv_proj splits into three equal row-chunks for to_q/to_k/to_v -- exact and
+        # lossless: per-row quantization scale means each output row (and its rotation, which
+        # only ever mixes along the shared *input* dimension) is fully independent of every
+        # other row, so slicing the int8 codes and per-row scales before dequantizing is
+        # identical to dequantizing the fused matrix first and slicing after.
+        qkv_prefix = f"{prefix}.attn.qkv_proj"
+        for sub in ("to_q", "to_k", "to_v"):
+            check_bias_matches(block.attn, sub, qkv_prefix)  # comfy's fused qkv_proj has one bias key (or none) for all three
+        conf = _parse_comfy_quant_blob(take(f"{qkv_prefix}.comfy_quant"))
+        rot = int(conf.get("convrot_groupsize", 256)) if conf.get("convrot") else 1
+        qkv_qdata = take(f"{qkv_prefix}.weight").to(device)
+        qkv_scale = take(f"{qkv_prefix}.weight_scale").to(device)
+        qkv_bias_key = f"{qkv_prefix}.bias"
+        qkv_bias = take(qkv_bias_key).to(device) if qkv_bias_key in keys else None
+        inner = qkv_qdata.shape[0] // 3
+        for j, sub in enumerate(("to_q", "to_k", "to_v")):
+            sub_bias = qkv_bias[j * inner:(j + 1) * inner] if qkv_bias is not None else None
+            setattr(
+                block.attn, sub,
+                ConvRotInt8Linear(
+                    qkv_qdata[j * inner:(j + 1) * inner], qkv_scale[j * inner:(j + 1) * inner],
+                    rot, sub_bias, dtype,
+                ),
+            )
+        for diffusers_suffix, comfy_suffix in _CONVROT_BLOCK_LINEAR_MAP.items():
+            comfy_full_prefix = f"{prefix}.{comfy_suffix}"
+            holder, attr = resolve(block, diffusers_suffix)
+            if diffusers_suffix == "adaln_proj.linear":
+                load_dequantized_dense_linear(holder, attr, comfy_full_prefix)  # kept dense, see function docstring
+            else:
+                load_quantized_linear(holder, attr, comfy_full_prefix)
+        for diffusers_suffix, comfy_suffix in _CONVROT_BLOCK_NORM_MAP.items():
+            holder, attr = resolve(block, diffusers_suffix)
+            load_dense_norm(getattr(holder, attr), f"{prefix}.{comfy_suffix}")
+
+    say(f"Populating {len(transformer.token_refiner.refiner_blocks)} token_refiner blocks "
+        "(unquantized in this checkpoint)...")
+    for i, rblock in enumerate(transformer.token_refiner.refiner_blocks):
+        prefix = f"token_refiner.blocks.{i}"
+        qkv_prefix = f"{prefix}.attn.qkv_proj"
+        for sub in ("to_q", "to_k", "to_v"):
+            check_bias_matches(rblock.attn, sub, qkv_prefix)
+        qkv_weight = take(f"{qkv_prefix}.weight").to(device=device, dtype=dtype)
+        qkv_bias_key = f"{qkv_prefix}.bias"
+        qkv_bias = take(qkv_bias_key).to(device=device, dtype=dtype) if qkv_bias_key in keys else None
+        inner = qkv_weight.shape[0] // 3
+        for j, sub in enumerate(("to_q", "to_k", "to_v")):
+            linear = torch.nn.Linear(qkv_weight.shape[1], inner, bias=qkv_bias is not None)
+            set_param(linear, "weight", qkv_weight[j * inner:(j + 1) * inner])
+            if qkv_bias is not None:
+                set_param(linear, "bias", qkv_bias[j * inner:(j + 1) * inner])
+            setattr(rblock.attn, sub, linear)
+        for diffusers_suffix, comfy_suffix in {
+            "attn.to_out.0": "attn.out_proj", "ff.net.0.proj": "mlp.fc1", "ff.net.2": "mlp.fc2",
+        }.items():
+            holder, attr = resolve(rblock, diffusers_suffix)
+            load_dense_linear(holder, attr, f"{prefix}.{comfy_suffix}")
+        for diffusers_suffix, comfy_suffix in {
+            "norm1": "norm1", "norm2": "norm2",
+            "attn.norm_q": "attn.q_norm", "attn.norm_k": "attn.k_norm",
+        }.items():
+            holder, attr = resolve(rblock, diffusers_suffix)
+            load_dense_norm(getattr(holder, attr), f"{prefix}.{comfy_suffix}")
+    # token_refiner's own final norm after all refiner blocks -- tries the name comfy itself uses
+    # (final_norm); the reconciliation check below catches it loudly if this trainer's diffusers
+    # commit named it differently, instead of silently leaving it randomly initialized.
+    if hasattr(transformer.token_refiner, "final_norm") and f"token_refiner.final_norm.weight" in keys:
+        load_dense_norm(transformer.token_refiner.final_norm, "token_refiner.final_norm")
+
+    # rope.inv_freq is the only checkpoint tensor deliberately never read (see the comment where
+    # top-level modules are populated above: diffusers computes it fresh from rope_freq_dim/
+    # rope_theta config, identical to the checkpoint's own buffer by construction). Everything
+    # else -- weights, biases, weight_scale, comfy_quant markers alike -- should have been
+    # consumed by construction of the helpers above (each one pulls a weight together with its
+    # own scale/bias/marker in the same call), so checking every leftover key, not just
+    # ".weight" ones, also catches a helper-internal inconsistency, not only a missing mapping.
+    unconsumed = sorted((keys - consumed) - {"rope.inv_freq"})
+    if unconsumed:
+        raise RuntimeError(
+            "load_transformer_convrot() left checkpoint tensors unused -- this trainer's "
+            f"diffusers-to-Comfy name mapping is missing something: {unconsumed[:20]}"
+            + (" ..." if len(unconsumed) > 20 else "")
+        )
+    still_meta = sorted(
+        name for name, p in list(transformer.named_parameters()) + list(transformer.named_buffers())
+        if p.device.type == "meta"
+    )
+    if still_meta:
+        raise RuntimeError(
+            "load_transformer_convrot() finished with parameters still on the meta device -- "
+            f"these were never populated from the checkpoint: {still_meta[:20]}"
+            + (" ..." if len(still_meta) > 20 else "")
+        )
+    say(f"Loaded {len(consumed)}/{len(keys)} checkpoint tensors "
+        f"(remainder were weight_scale/comfy_quant marker tensors, consumed alongside their weights).")
+
     transformer.requires_grad_(False)
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
@@ -795,7 +1205,10 @@ def main() -> None:
     # that's a bigger chunk than it sounds) + LoRA + activations/gradients for backprop. Phase 1
     # (both encoders resident at once) would not have fit on the same GPU as phase 2's peak either
     # way, which is the actual reason these are two separate phases, not one combined estimate.
-    transformer = load_transformer(args, device)
+    transformer = (
+        load_transformer_convrot(args, device) if args.quant_source == "comfy_convrot"
+        else load_transformer(args, device)
+    )
     transformer = inject_lora(transformer, args.rank, args.lora_alpha)
 
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
