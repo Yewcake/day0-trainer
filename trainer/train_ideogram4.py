@@ -73,6 +73,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_every_n_steps", type=int, default=500)
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--learning_rate", default="5e-5")
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    # diffusion-pipe's own adapter config (read directly from its train.py, not assumed): "lora" and
+    # "lokr" are the only two types it implements, everything else raises NotImplementedError there.
+    # decompose_factor is LoKr's own name for what this codebase's other trainers call lokr_factor
+    # (kohya/LyCORIS convention) -- -1 lets diffusion-pipe auto-pick a factor, a positive value pins
+    # it (4 is a common choice, smaller = more parameters/expressiveness, closer to full LoRA).
+    parser.add_argument("--network_type", default="lora", choices=["lora", "lokr"])
+    parser.add_argument("--lokr_factor", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -291,6 +299,26 @@ def prepare_dataset_toml(staged_dir: Path, resolution: int) -> Path:
 
 
 def write_training_config(args: argparse.Namespace, dataset_toml: Path, dp_out_dir: Path) -> Path:
+    # diffusion-pipe's own adapter config keys (read from its train.py): "lora" only needs
+    # rank/alpha/dropout, "lokr" additionally takes decompose_factor (-1 = let diffusion-pipe
+    # auto-pick) and rank_dropout. alpha = rank for both, matching diffusion-pipe's own
+    # `adapter_config['alpha'] = adapter_config['rank']` default.
+    if args.network_type == "lokr":
+        adapter_toml = (
+            "[adapter]\n"
+            'type = "lokr"\n'
+            f"rank = {args.rank}\n"
+            f"decompose_factor = {args.lokr_factor}\n"
+            'dtype = "bfloat16"\n\n'
+        )
+    else:
+        adapter_toml = (
+            "[adapter]\n"
+            'type = "lora"\n'
+            f"rank = {args.rank}\n"
+            'dtype = "bfloat16"\n\n'
+        )
+
     config_path = REPO_DIR / f"config_{args.run_name}.toml"
     config_path.write_text(
         f'output_dir = "{dp_out_dir}"\n'
@@ -302,6 +330,9 @@ def write_training_config(args: argparse.Namespace, dataset_toml: Path, dp_out_d
         "gradient_accumulation_steps = 1\n"
         "pipeline_stages = 1\n"
         "gradient_clipping = 1.0\n"
+        # diffusion-pipe's own cosine scheduler hardcodes eta_min=1e-6 (T_max = full run length,
+        # read directly from its train.py) -- no config override exists for that floor, it's just
+        # what "cosine" always does there. Already the trainer's only scheduler choice, not new.
         'lr_scheduler = "cosine"\n'
         "warmup_steps = 100\n"
         f"save_every_n_steps = {args.save_every_n_steps}\n"
@@ -324,15 +355,12 @@ def write_training_config(args: argparse.Namespace, dataset_toml: Path, dp_out_d
         'diffusion_model_dtype = "float8"\n'
         'timestep_sample_method = "logit_normal"\n'
         "shift = 3\n\n"
-        "[adapter]\n"
-        'type = "lora"\n'
-        f"rank = {args.rank}\n"
-        'dtype = "bfloat16"\n\n'
+        f"{adapter_toml}"
         "[optimizer]\n"
         'type = "adamw8bit"\n'
         f"lr = {args.learning_rate}\n"
         "betas = [0.9, 0.99]\n"
-        "weight_decay = 0.01\n"
+        f"weight_decay = {args.weight_decay}\n"
         "eps = 1e-8\n\n"
         "[monitoring]\n"
         "enable_wandb = false\n"

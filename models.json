@@ -33,7 +33,7 @@
       "arch": "ideogram4",
       "trainer": "trainer/train_ideogram4.py",
       "default_path": "Comfy-Org/Ideogram-4",
-      "networks": ["lora"],
+      "networks": ["lora", "lokr"],
       "enabled": true
     },
     {

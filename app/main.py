@@ -1374,6 +1374,9 @@ def create_job(payload: dict) -> dict:
             "--save_every_n_steps", str(config["save_every"]),
             "--rank", str(rank),
             "--learning_rate", str(config["learning_rate"]),
+            "--weight_decay", str(config["weight_decay"]),
+            "--network_type", network,
+            "--lokr_factor", str(config["lokr_factor"]),
             "--seed", str(config["seed"]),
         ]
     elif model_entry["arch"] == "minimax_h3":

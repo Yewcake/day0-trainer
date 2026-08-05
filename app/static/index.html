@@ -289,8 +289,8 @@ async function showTrain(){
         <option value="16">16</option>
         <option value="32">32</option>
       </select></div>
-      <div class="row lokr-only"><label>LoKr full rank</label><select id="f_fullrank"><option value="0">No (small files)</option><option value="1">Yes (max quality, huge files)</option></select></div>
-      <div class="row lokr-only"><label>LoKr decompose both</label><select id="f_decompose"><option value="0">No</option><option value="1">Yes</option></select></div>
+      <div class="row lokr-only" id="row-lokr-fullrank"><label>LoKr full rank</label><select id="f_fullrank"><option value="0">No (small files)</option><option value="1">Yes (max quality, huge files)</option></select></div>
+      <div class="row lokr-only" id="row-lokr-decompose"><label>LoKr decompose both</label><select id="f_decompose"><option value="0">No</option><option value="1">Yes</option></select></div>
       <div class="row" id="row-resolution"><label>Resolution</label><input id="f_res" type="number" value="1024"></div>
       <div class="row" id="row-optimizer"><label>Optimizer</label><select id="f_optimizer">
         <option value="paged_adamw8bit" selected>Paged AdamW 8-bit (default, memory-safe)</option>
@@ -358,12 +358,16 @@ async function showTrain(){
   onModelChange();
 }
 
-// Ideogram4 trains via a completely different framework (diffusion-pipe/DeepSpeed,
-// not our own loop) -- it only supports LoRA (no LoKr adapter type), and Masterchef
-// Cooking is wired into our own trainer's loop specifically, so neither applies.
+// Ideogram4 trains via a completely different framework (diffusion-pipe/DeepSpeed, not
+// our own loop) -- Masterchef Cooking is wired into our own trainer's loop specifically,
+// so that (and the LoRA-only text_fusion concept) doesn't apply here. diffusion-pipe DOES
+// support a LoKr adapter type though (confirmed by reading its own train.py), just a
+// simpler one than our own Krea2 LoKr path: only a factor (decompose_factor), no separate
+// full-rank/decompose-both knobs -- those two sub-fields are hidden for Ideogram4 rather
+// than shown-but-silently-ignored.
 //
-// MiniMax-H3 (trainer/train_minimax_h3.py) is a third, video-only framework: no LoKr,
-// no Masterchef, no text_fusion concept, and -- unlike the other two -- no sample
+// MiniMax-H3 (trainer/train_minimax_h3.py) is a third, video-only framework: no LoKr at
+// all, no Masterchef, no text_fusion concept, and -- unlike the other two -- no sample
 // generation, no validation-image loss curve, and no Gemini auto-analyze at all (that
 // script's own docstring says why: reusing the modular inference pipeline for previews
 // is deferred work, not done yet). It adds two fields neither other model has: which of
@@ -373,18 +377,22 @@ function onModelChange(){
   const entry = models.find(m => m.id === $('#f_model').value);
   const isIdeogram4 = !!entry && entry.arch === 'ideogram4';
   const isH3 = !!entry && entry.arch === 'minimax_h3';
-  const noLokr = isIdeogram4 || isH3;
+  const noLokr = isH3; // Ideogram4/diffusion-pipe supports lokr too now, only H3 has no LoKr adapter type at all
+  const noMasterchefOrTextFusion = isIdeogram4 || isH3; // both run a loop we don't control the internals of
   const lokrOpt = $('#f_network_lokr_opt');
   if (lokrOpt) lokrOpt.disabled = noLokr;
   if (noLokr && $('#f_network').value === 'lokr'){
     $('#f_network').value = 'lora';
     $('#jobform').classList.remove('is-lokr');
   }
+  ['row-lokr-fullrank', 'row-lokr-decompose'].forEach(id => {
+    const el = $('#'+id); if (el) el.style.display = isIdeogram4 ? 'none' : '';
+  });
   const mcRow = $('#row-masterchef');
-  if (mcRow) mcRow.style.display = noLokr ? 'none' : '';
+  if (mcRow) mcRow.style.display = noMasterchefOrTextFusion ? 'none' : '';
   const tfRow = $('#row-text-fusion');
-  if (tfRow) tfRow.style.display = noLokr ? 'none' : '';
-  if (noLokr){
+  if (tfRow) tfRow.style.display = noMasterchefOrTextFusion ? 'none' : '';
+  if (noMasterchefOrTextFusion){
     const mc = $('#f_masterchef');
     if (mc) mc.checked = false;
     const tf = $('#f_include_text_fusion');
