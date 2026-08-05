@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.99)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
-    parser.add_argument("--lr_scheduler", default="cosine", choices=["cosine"])
+    parser.add_argument("--lr_scheduler", default="cosine", choices=["cosine", "constant", "linear"])
     parser.add_argument("--lr_warmup_steps", type=int, default=100)
     parser.add_argument("--lora_type", default="character", choices=["character", "style", "pose", "custom"])
     parser.add_argument("--target_modules", default="character")
@@ -1021,7 +1021,7 @@ def apply_peft_scaling(model, multiplier: float) -> int:
 def train(args: argparse.Namespace) -> None:
     from diffusers import Krea2Pipeline
     from peft import LoraConfig, get_peft_model_state_dict
-    from transformers import get_cosine_schedule_with_warmup
+    from transformers import get_scheduler
 
     try:
         import bitsandbytes as bnb
@@ -1211,8 +1211,12 @@ def train(args: argparse.Namespace) -> None:
             weight_decay=args.weight_decay,
         )
 
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
+    # "constant" maps to "constant_with_warmup" -- args.lr_warmup_steps always applies regardless of
+    # which post-warmup shape is chosen, constant/linear/cosine only differ in what happens after.
+    scheduler_name = "constant_with_warmup" if args.lr_scheduler == "constant" else args.lr_scheduler
+    scheduler = get_scheduler(
+        scheduler_name,
+        optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps,
         num_training_steps=args.max_train_steps,
     )

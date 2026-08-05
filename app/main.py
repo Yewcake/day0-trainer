@@ -1344,6 +1344,7 @@ def create_job(payload: dict) -> dict:
         "masterchef_enabled": False, "include_text_fusion": False,
         "partition": "FL2VA", "num_frames": 73, "short_edge": 768,
         "train_audio": False, "audio_loss_weight": 1.0,
+        "lr_scheduler": "cosine",
         "seed": 42,
     }
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
@@ -1377,6 +1378,7 @@ def create_job(payload: dict) -> dict:
             "--weight_decay", str(config["weight_decay"]),
             "--network_type", network,
             "--lokr_factor", str(config["lokr_factor"]),
+            "--lr_scheduler", str(config["lr_scheduler"]),
             "--seed", str(config["seed"]),
         ]
     elif model_entry["arch"] == "minimax_h3":
@@ -1401,6 +1403,7 @@ def create_job(payload: dict) -> dict:
             "--learning_rate", str(config["learning_rate"]),
             "--weight_decay", str(config["weight_decay"]),
             "--lr_warmup_steps", str(config["warmup_steps"]),
+            "--lr_scheduler", str(config["lr_scheduler"]),
             "--train_batch_size", str(config["batch_size"]),
             "--gradient_checkpointing", str(config["gradient_checkpointing"]),
             "--train_audio", "1" if config["train_audio"] else "0",
@@ -1432,7 +1435,7 @@ def create_job(payload: dict) -> dict:
             "--lokr_decompose_both", str(config["lokr_decompose_both"]),
             "--learning_rate", str(config["learning_rate"]),
             "--weight_decay", str(config["weight_decay"]),
-            "--lr_scheduler", "cosine",
+            "--lr_scheduler", str(config["lr_scheduler"]),
             "--lr_warmup_steps", str(config["warmup_steps"]),
             "--target_modules", str(config["target_modules"]),
             "--include_text_fusion", "1" if config["include_text_fusion"] else "0",

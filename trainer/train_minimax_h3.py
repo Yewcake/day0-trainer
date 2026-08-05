@@ -82,7 +82,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import random
 import subprocess
@@ -192,6 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--lr_warmup_steps", type=int, default=100)
+    parser.add_argument("--lr_scheduler", default="cosine", choices=["cosine", "constant", "linear"])
     # The training loop pulls one cached (clip, caption) pair per step -- batching multiple clips of
     # different aspect ratios/lengths into one packed layout isn't implemented, so this is accepted
     # (main.py's job form has a general Batch size field) but enforced to be 1, not silently ignored.
@@ -790,10 +790,16 @@ def main() -> None:
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
     say(f"Trainable LoRA params: {sum(p.numel() for p in trainable_params):,}")
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: min(1.0, step / max(1, args.lr_warmup_steps))
-        * (0.5 * (1 + math.cos(math.pi * step / max(1, args.max_train_steps)))),
+    # transformers.get_scheduler() rather than a hand-rolled LambdaLR -- "constant" maps to
+    # "constant_with_warmup" since this trainer's warmup_steps always applies regardless of which
+    # post-warmup shape is chosen (constant/linear/cosine all ramp up the same way first, they only
+    # differ in what happens after warmup ends).
+    from transformers import get_scheduler
+
+    scheduler_name = "constant_with_warmup" if args.lr_scheduler == "constant" else args.lr_scheduler
+    lr_scheduler = get_scheduler(
+        scheduler_name, optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps,
     )
 
     say(f"Starting training: {args.max_train_steps} steps, batch size {args.train_batch_size}.")

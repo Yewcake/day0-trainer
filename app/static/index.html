@@ -302,7 +302,16 @@ async function showTrain(){
       <div class="row"><label>Learning rate</label><input id="f_lr" value="1e-4"></div>
       <div class="row"><label>Weight decay</label><input id="f_wd" value="0.01"></div>
       <div class="row" id="row-gc"><label>Gradient checkpointing</label><select id="f_gc"><option value="0">Off</option><option value="1" selected>On (saves VRAM)</option></select></div>
-      <div class="row" id="row-schedule"><label>LR schedule</label><input id="f_schedule" disabled></div>
+      <div class="row" id="row-schedule"><label>LR schedule</label>
+        <div>
+          <select id="f_schedule" onchange="updateScheduleDisplay()">
+            <option value="cosine" selected>Cosine (decays to ~0 by the end)</option>
+            <option value="constant">Constant (flat after warmup)</option>
+            <option value="linear">Linear (decays to 0 by the end)</option>
+          </select>
+          <div class="hint" id="f_schedule_hint"></div>
+        </div>
+      </div>
     </div>
     <div class="row" id="row-h3-partition" style="display:none"><label>Partition</label><select id="f_partition">
       <option value="FL2VA" selected>FL2VA — plain text/image-to-video (no reference identity)</option>
@@ -409,14 +418,15 @@ function onModelChange(){
   }
 }
 
-// Cosine is the only scheduler this trainer supports (--lr_scheduler has one choice), so
-// there's no dropdown for it -- this just makes it visible instead of being an invisible
-// backend default, and shows the actual warmup step count computed from the current Steps.
+// All three trainers now support cosine/constant/linear (--lr_scheduler), warmup always ramps
+// the same way first regardless of which one is picked -- this just shows the actual warmup
+// step count computed from the current Steps, diffusion-pipe's own "constant" is the one
+// exception (no warmup ramp at all, see train_ideogram4.py's own comment on that).
 function updateScheduleDisplay(){
   const steps = parseInt($('#f_steps')?.value) || 0;
   const warmup = Math.max(1, Math.round(steps * 0.05));
-  const el = $('#f_schedule');
-  if (el) el.value = steps ? `Cosine · warmup ${warmup} steps (5% of ${steps})` : 'Cosine · 5% warmup';
+  const el = $('#f_schedule_hint');
+  if (el) el.textContent = steps ? `Warmup: ${warmup} steps (5% of ${steps})` : 'Warmup: 5% of steps';
 }
 
 function applyTriggerToPrompts(){
@@ -539,6 +549,7 @@ async function submitJob(ev){
     save_every:+$('#f_save').value, sample_every:+$('#f_sample').value,
     optimizer: $('#f_optimizer').value,
     learning_rate: $('#f_lr').value, weight_decay:+$('#f_wd').value,
+    lr_scheduler: $('#f_schedule').value,
     gradient_checkpointing:+$('#f_gc').value,
     validation_image: $('#f_valimage').value, validation_prompt: $('#f_valprompt').value.trim(),
     auto_analyze: $('#f_autoanalyze').checked,

@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     # it (4 is a common choice, smaller = more parameters/expressiveness, closer to full LoRA).
     parser.add_argument("--network_type", default="lora", choices=["lora", "lokr"])
     parser.add_argument("--lokr_factor", type=int, default=-1)
+    # diffusion-pipe's own train.py implements exactly these three names (read from source): "constant"
+    # (torch.optim.lr_scheduler.ConstantLR, factor=1.0 -- no ramp, unlike this codebase's other two
+    # trainers' "constant" which does ramp via warmup_steps first, a real behavioral difference this
+    # framework's own scheduler code causes, not something worth patching diffusion-pipe to "fix"),
+    # "linear" (LinearLR), "cosine" (CosineAnnealingLR, hardcoded eta_min=1e-6 with no override).
+    parser.add_argument("--lr_scheduler", default="cosine", choices=["cosine", "constant", "linear"])
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -332,8 +338,8 @@ def write_training_config(args: argparse.Namespace, dataset_toml: Path, dp_out_d
         "gradient_clipping = 1.0\n"
         # diffusion-pipe's own cosine scheduler hardcodes eta_min=1e-6 (T_max = full run length,
         # read directly from its train.py) -- no config override exists for that floor, it's just
-        # what "cosine" always does there. Already the trainer's only scheduler choice, not new.
-        'lr_scheduler = "cosine"\n'
+        # what "cosine" always does there.
+        f'lr_scheduler = "{args.lr_scheduler}"\n'
         "warmup_steps = 100\n"
         f"save_every_n_steps = {args.save_every_n_steps}\n"
         "checkpoint_every_n_minutes = 120\n"
