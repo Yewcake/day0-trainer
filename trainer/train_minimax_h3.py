@@ -914,6 +914,15 @@ def main() -> None:
             loss = loss + args.audio_loss_weight * audio_loss
 
         loss.backward()
+        # Missing entirely until now -- both other trainers in this codebase clip (train_krea2_lora_
+        # direct.py's own clip_grad_norm_(trainable, 1.0), diffusion-pipe's hardcoded gradient_clipping
+        # = 1.0 for Ideogram4), this one didn't. Particularly risky to skip here specifically: --train_
+        # batch_size is enforced to 1 (no batch-averaging to smooth an outlier clip's gradient), and
+        # adaln_proj.linear is now a LoRA target -- a single AdaLN-zero modulation projection that
+        # directly rescales/shifts an entire block's residual output, so one unclipped gradient spike
+        # on it can push that block into a bad regime for the rest of the run in a way that a normal
+        # attention/FF layer's update wouldn't. Matches the same 1.0 norm the other two trainers use.
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
