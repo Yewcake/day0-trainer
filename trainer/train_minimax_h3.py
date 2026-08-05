@@ -949,14 +949,24 @@ def main() -> None:
             # confirmed this crashes step 25's checkpoint save after steps 1/10/20 trained correctly.
             # Replicated the rest of that method's actual logic directly (it's just
             # get_peft_model_state_dict + safetensors.save_file) instead of waiting on an upstream fix
-            # to an unreleased branch -- we don't want the fp32 upcast anyway, bf16 LoRA weights are
-            # standard and this sidesteps the broken call entirely rather than working around it.
+            # to an unreleased branch.
             from peft.utils import get_peft_model_state_dict
             import safetensors.torch
 
             ckpt_dir = checkpoints_dir / f"step-{global_step:06d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             lora_state_dict = get_peft_model_state_dict(transformer, adapter_name="default")
+            # PEFT keeps LoRA A/B in float32 by default whenever the base layer is bitsandbytes-
+            # quantized (our case, --quantize_base 1) -- confirmed live: checkpoints were coming out
+            # ~2x the size a bf16 save would produce, and get_peft_model_state_dict() applies no
+            # casting of its own, it just returns whatever dtype the adapter parameters were created
+            # in. The earlier version of this comment assumed avoiding save_lora_adapter()'s broken
+            # fp32 upcast call meant we already had bf16 -- wrong, that upcast was never the source of
+            # the fp32-ness to begin with. bf16 LoRA weights load in ComfyUI exactly the same as fp32
+            # ones (same as every other diffusion LoRA in the wild); this just halves the file size
+            # for identical trained weights, not a quality tradeoff.
+            save_dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
+            lora_state_dict = {k: v.to(save_dtype) for k, v in lora_state_dict.items()}
             # get_peft_model_state_dict() returns diffusers-shaped keys (transformer_blocks.N.attn.
             # to_q/to_k/to_v, separate Linears) -- but ComfyUI's native MiniMax-H3 support targets the
             # original release's fused-qkv_proj layout instead (see convert_lora_to_comfyui_native()'s
