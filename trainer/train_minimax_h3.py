@@ -691,12 +691,17 @@ def load_transformer_convrot(args, device):
         `torch` through the closure over this function's own `import torch` above, no separate
         import needed inside __init__/forward.
 
-        No real `.weight` Parameter is kept (mirrors ai-toolkit's own `_to_ostris()` pattern:
-        `del module._parameters["weight"]`) -- verified safe against real peft source before
-        relying on it, not assumed: LoraLayer.update_layer() (the code that creates lora_A/lora_B
-        for a target module) only reads `self.in_features`/`self.out_features` for sizing, and
-        only touches `base_layer.weight` inside the pissa/olora/loftq/corda init-scheme branches,
-        none of which this trainer uses (inject_lora() passes init_lora_weights="gaussian").
+        `.weight` is kept as nn.Linear's own meta-device placeholder (zero real memory), not
+        deleted -- a live run confirmed deleting it (mirroring ai-toolkit's own `_to_ostris()`
+        pattern, `del module._parameters["weight"]`) crashes PEFT: LoraLayer.__init__ calls
+        peft's `_get_in_out_features()`, which for any nn.Linear reads `module.weight` first
+        (an isinstance(..., DTensor) check for tensor-parallel support, unrelated to us) before
+        falling through to `module.in_features`/`out_features` -- so `.weight` must exist and be
+        accessible even though its data is never actually used. Separately, LoraLayer.
+        update_layer() (the code that creates lora_A/lora_B for a target module) only reads
+        `self.in_features`/`self.out_features` for sizing, and only touches `base_layer.weight`'s
+        values inside the pissa/olora/loftq/corda init-scheme branches, none of which this
+        trainer uses (inject_lora() passes init_lora_weights="gaussian").
         Forward delegation is `self.base_layer(x)` -- calls this class's own forward() directly,
         never reads `.weight`. isinstance(module, torch.nn.Linear) is what inject_lora() checks to
         build its target list, and this class satisfies that by real inheritance, not duck-typing."""
@@ -704,7 +709,17 @@ def load_transformer_convrot(args, device):
         def __init__(self, qdata, scale, rot_size: int, bias, compute_dtype):
             out_features, in_features = qdata.shape
             super().__init__(in_features, out_features, bias=bias is not None, device="meta")
-            del self._parameters["weight"]
+            # Live run confirmed deleting this crashes PEFT: LoraLayer.__init__ calls peft's
+            # _get_in_out_features(), which for any nn.Linear does `module.weight` FIRST (to
+            # check isinstance(..., DTensor), for tensor-parallel support we don't use) before
+            # falling through to module.in_features/out_features (the plain ints, already
+            # correct) -- so .weight must exist and not error on access, even though its actual
+            # data is never read for a non-DTensor. Left as nn.Linear's own meta-device
+            # placeholder (zero real memory) rather than deleted; explicitly frozen here instead
+            # of relying on this trainer's later whole-model requires_grad_(False) call, since a
+            # stray requires_grad=True meta parameter reaching the optimizer would try to
+            # allocate momentum state against a tensor with no real storage.
+            self.weight.requires_grad_(False)
             if bias is not None:
                 self.bias = torch.nn.Parameter(bias.to(compute_dtype), requires_grad=False)
             self.register_buffer("cr8_qdata", qdata, persistent=False)
