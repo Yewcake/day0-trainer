@@ -691,16 +691,26 @@ def load_transformer_convrot(args, device):
         `torch` through the closure over this function's own `import torch` above, no separate
         import needed inside __init__/forward.
 
-        `.weight` is kept as nn.Linear's own meta-device placeholder (zero real memory), not
-        deleted -- a live run confirmed deleting it (mirroring ai-toolkit's own `_to_ostris()`
-        pattern, `del module._parameters["weight"]`) crashes PEFT: LoraLayer.__init__ calls
-        peft's `_get_in_out_features()`, which for any nn.Linear reads `module.weight` first
-        (an isinstance(..., DTensor) check for tensor-parallel support, unrelated to us) before
-        falling through to `module.in_features`/`out_features` -- so `.weight` must exist and be
-        accessible even though its data is never actually used. Separately, LoraLayer.
-        update_layer() (the code that creates lora_A/lora_B for a target module) only reads
+        `.weight` is kept as a TINY (shape (1,)) real Parameter on the real device, not a
+        full-size meta placeholder and not deleted -- two live/local findings shaped this,
+        in order: (1) deleting it (mirroring ai-toolkit's own `_to_ostris()` pattern, `del
+        module._parameters["weight"]`) crashes PEFT -- LoraLayer.__init__ calls peft's
+        `_get_in_out_features()`, which for any nn.Linear reads `module.weight` first (an
+        isinstance(..., DTensor) check for tensor-parallel support, unrelated to us) before
+        falling through to `module.in_features`/`out_features` -- so `.weight` must exist and
+        be accessible. (2) Leaving it on the *meta* device (real existence, wrong device) is
+        ALSO wrong, caught only via a local CPU repro of this exact injection path outside the
+        real 33B model: PEFT's `_move_adapter_to_device_of_base_layer()` reads
+        `base_layer.weight.device` to decide where to place the newly-created lora_A/lora_B --
+        so a meta `.weight` silently moved the real, Gaussian-initialized LoRA parameters to
+        meta too, discarding their init values (confirmed: lora_A/lora_B ended up device=meta
+        after injection, and backward failed with "MmBackward0 returned an invalid gradient
+        ... expected device meta but got cpu"). `_get_in_out_features()` never reads `.weight`'s
+        *shape* for a plain non-DTensor nn.Linear, only its existence/dtype, so a tiny stand-in
+        on the real device satisfies both constraints at once, at negligible memory cost.
+        Separately, LoraLayer.update_layer() (the code that creates lora_A/lora_B) only reads
         `self.in_features`/`self.out_features` for sizing, and only touches `base_layer.weight`'s
-        values inside the pissa/olora/loftq/corda init-scheme branches, none of which this
+        VALUES inside the pissa/olora/loftq/corda init-scheme branches, none of which this
         trainer uses (inject_lora() passes init_lora_weights="gaussian").
         Forward delegation is `self.base_layer(x)` -- calls this class's own forward() directly,
         never reads `.weight`. isinstance(module, torch.nn.Linear) is what inject_lora() checks to
@@ -709,17 +719,23 @@ def load_transformer_convrot(args, device):
         def __init__(self, qdata, scale, rot_size: int, bias, compute_dtype):
             out_features, in_features = qdata.shape
             super().__init__(in_features, out_features, bias=bias is not None, device="meta")
-            # Live run confirmed deleting this crashes PEFT: LoraLayer.__init__ calls peft's
-            # _get_in_out_features(), which for any nn.Linear does `module.weight` FIRST (to
-            # check isinstance(..., DTensor), for tensor-parallel support we don't use) before
-            # falling through to module.in_features/out_features (the plain ints, already
-            # correct) -- so .weight must exist and not error on access, even though its actual
-            # data is never read for a non-DTensor. Left as nn.Linear's own meta-device
-            # placeholder (zero real memory) rather than deleted; explicitly frozen here instead
-            # of relying on this trainer's later whole-model requires_grad_(False) call, since a
-            # stray requires_grad=True meta parameter reaching the optimizer would try to
-            # allocate momentum state against a tensor with no real storage.
-            self.weight.requires_grad_(False)
+            # .weight must exist (LoraLayer.__init__ -> peft's _get_in_out_features() reads
+            # `module.weight` before falling through to module.in_features/out_features -- see
+            # the class docstring), but it must NOT be on the meta device, discovered only via a
+            # local CPU repro (no GPU/checkpoint needed) of the exact PEFT injection path: PEFT's
+            # BaseTunerLayer._move_adapter_to_device_of_base_layer() reads base_layer.weight.device
+            # to decide where to place the newly-created lora_A/lora_B -- so leaving .weight on
+            # meta silently moved the real, Gaussian-initialized LoRA parameters to meta too,
+            # discarding their init values in the process (confirmed: lora_A/lora_B.weight.device
+            # was "meta" after injection, and backward failed with "MmBackward0 returned an
+            # invalid gradient ... expected device meta but got cpu"). Fixed with a TINY (shape
+            # (1,)) real tensor on the real device instead of a full-size meta placeholder --
+            # _get_in_out_features() never reads .weight's shape for a plain (non-DTensor)
+            # nn.Linear, only its existence and dtype, so the true (out, in) shape was never
+            # needed here in the first place.
+            self.weight = torch.nn.Parameter(
+                torch.zeros(1, device=qdata.device, dtype=compute_dtype), requires_grad=False
+            )
             if bias is not None:
                 self.bias = torch.nn.Parameter(bias.to(compute_dtype), requires_grad=False)
             self.register_buffer("cr8_qdata", qdata, persistent=False)
