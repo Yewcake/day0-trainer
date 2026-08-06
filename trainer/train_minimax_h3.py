@@ -932,10 +932,21 @@ def load_transformer_convrot(args, device):
             f"diffusers-to-Comfy name mapping is missing something: {unconsumed[:20]}"
             + (" ..." if len(unconsumed) > 20 else "")
         )
-    still_meta = sorted(
-        name for name, p in list(transformer.named_parameters()) + list(transformer.named_buffers())
-        if p.device.type == "meta"
-    )
+    # ConvRotInt8Linear.weight is EXPECTED to stay on the meta device forever (see that class's
+    # own docstring) -- it's a placeholder kept only so peft's _get_in_out_features() has
+    # something to access, real data lives in cr8_qdata/cr8_scale instead. Exempt it by identity
+    # (module type + param name), not by pattern-matching the name string, so this still catches
+    # a genuinely unpopulated ".weight" anywhere else.
+    still_meta = []
+    for mod_name, module in transformer.named_modules():
+        is_convrot = isinstance(module, ConvRotInt8Linear)
+        for p_name, p in list(module.named_parameters(recurse=False)) + list(module.named_buffers(recurse=False)):
+            if p.device.type != "meta":
+                continue
+            if is_convrot and p_name == "weight":
+                continue
+            still_meta.append(f"{mod_name}.{p_name}" if mod_name else p_name)
+    still_meta.sort()
     if still_meta:
         raise RuntimeError(
             "load_transformer_convrot() finished with parameters still on the meta device -- "
