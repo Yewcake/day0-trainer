@@ -918,6 +918,19 @@ def load_transformer_convrot(args, device):
     if hasattr(transformer.token_refiner, "final_norm") and f"token_refiner.final_norm.weight" in keys:
         load_dense_norm(transformer.token_refiner.final_norm, "token_refiner.final_norm")
 
+    # Live run caught a real gap: init_empty_weights() only meta-ifies *parameters* by default
+    # (accelerate's own include_buffers defaults to False), not buffers created via
+    # register_buffer() -- so rope.inv_freq (populated with real, correct values by diffusers'
+    # own __init__, never touched by this loader since it's a deterministic function of
+    # rope_freq_dim/rope_theta config, not checkpoint data) was silently sitting on CPU the
+    # whole time, not meta, so still_meta's own check never caught it either. Move any leftover
+    # CPU-resident buffer to the real device generically here rather than special-casing
+    # "rope.inv_freq" by name, in case another such buffer exists elsewhere in the model.
+    for module in transformer.modules():
+        for buf_name, buf in list(module.named_buffers(recurse=False)):
+            if buf.device.type == "cpu":
+                setattr(module, buf_name, buf.to(device))
+
     # rope.inv_freq is the only checkpoint tensor deliberately never read (see the comment where
     # top-level modules are populated above: diffusers computes it fresh from rope_freq_dim/
     # rope_theta config, identical to the checkpoint's own buffer by construction). Everything
