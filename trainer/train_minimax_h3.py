@@ -1181,38 +1181,64 @@ def convert_lora_to_comfyui_native(lora_state_dict: dict) -> dict:
     ComfyUI's fused qkv_proj can actually load. out_proj/mlp.fc1/mlp.fc2 need only the name change,
     diffusers didn't restructure those, just renamed them (confirmed against comfy/ldm/minimax/
     model.py's DiTBlock: self.attn.out_proj, self.mlp.fc1, self.mlp.fc2, under self.blocks -- not
-    self.transformer_blocks, that name doesn't exist on ComfyUI's side either)."""
+    self.transformer_blocks, that name doesn't exist on ComfyUI's side either).
+
+    token_refiner gets the identical treatment, not just the main blocks -- a real live bug found by
+    reading a ComfyUI log carefully: token_refiner's own attention reuses the SAME Attention class as
+    the main blocks (confirmed against comfy/ldm/minimax/model.py's TokenRefiner: `self.blocks`, a
+    ModuleList of RefinerBlock, each with the same fused `self.attn.qkv_proj` -- not "refiner_blocks",
+    that name doesn't exist on ComfyUI's side either), so its LoRA needs the identical fuse-qkv +
+    rename-out_proj/mlp treatment. This function used to only match "transformer_blocks.N." keys,
+    leaving every token_refiner.refiner_blocks.* key passed through unchanged (still diffusers-shaped,
+    separate to_q/to_k/to_v, wrong prefix) -- ComfyUI's key matcher found no such module at all under
+    either name, so every one of those 12 keys silently failed with "lora key not loaded", the LoRA's
+    effect on the token_refiner text-preprocessing stack was a complete no-op despite training and
+    saving without any error."""
     import re
     import torch
 
     RENAME = {"attn.to_out.0": "attn.out_proj", "ff.net.0.proj": "mlp.fc1", "ff.net.2": "mlp.fc2"}
     QKV_PARTS = ("attn.to_q", "attn.to_k", "attn.to_v")
+    # (diffusers key-prefix pattern, ComfyUI-native output prefix template) -- checked in order,
+    # first match wins. Both fuse the same way; only the prefix rewrite differs.
+    PREFIX_PATTERNS = (
+        (re.compile(r"transformer_blocks\.(\d+)\.(.+)$"), "blocks.{}"),
+        (re.compile(r"token_refiner\.refiner_blocks\.(\d+)\.(.+)$"), "token_refiner.blocks.{}"),
+    )
 
-    qkv_parts: dict[int, dict[tuple[str, str], "torch.Tensor"]] = {}
+    # Keyed by the full ComfyUI-native output prefix (e.g. "blocks.0" vs "token_refiner.blocks.0"),
+    # not a bare block index -- the two namespaces both start counting from 0, so a bare int key
+    # would silently collide the main blocks' and token_refiner's qkv parts together.
+    qkv_parts: dict[str, dict[tuple[str, str], "torch.Tensor"]] = {}
     out: dict[str, "torch.Tensor"] = {}
     for key, tensor in lora_state_dict.items():
-        m = re.match(r"transformer_blocks\.(\d+)\.(.+)$", key)
+        m = None
+        for pattern, out_prefix_template in PREFIX_PATTERNS:
+            m = pattern.match(key)
+            if m:
+                break
         if not m:
             out[key] = tensor  # nothing in this trainer's target list should hit this, kept as a safety net
             continue
-        block_idx, rest = int(m.group(1)), m.group(2)
+        rest = m.group(2)
+        out_prefix = out_prefix_template.format(m.group(1))
         matched_qkv = next((p for p in QKV_PARTS if rest.startswith(p)), None)
         if matched_qkv:
             suffix = rest[len(matched_qkv):]  # ".lora_A.weight" or ".lora_B.weight"
-            qkv_parts.setdefault(block_idx, {})[(matched_qkv, suffix)] = tensor
+            qkv_parts.setdefault(out_prefix, {})[(matched_qkv, suffix)] = tensor
             continue
         renamed = rest
         for old, new in RENAME.items():
             if rest.startswith(old):
                 renamed = new + rest[len(old):]
                 break
-        out[f"blocks.{block_idx}.{renamed}"] = tensor
+        out[f"{out_prefix}.{renamed}"] = tensor
 
-    for block_idx, parts in qkv_parts.items():
+    for out_prefix, parts in qkv_parts.items():
         a_q, a_k, a_v = (parts[(p, ".lora_A.weight")] for p in QKV_PARTS)
         b_q, b_k, b_v = (parts[(p, ".lora_B.weight")] for p in QKV_PARTS)
-        out[f"blocks.{block_idx}.attn.qkv_proj.lora_A.weight"] = torch.cat([a_q, a_k, a_v], dim=0)
-        out[f"blocks.{block_idx}.attn.qkv_proj.lora_B.weight"] = torch.block_diag(b_q, b_k, b_v)
+        out[f"{out_prefix}.attn.qkv_proj.lora_A.weight"] = torch.cat([a_q, a_k, a_v], dim=0)
+        out[f"{out_prefix}.attn.qkv_proj.lora_B.weight"] = torch.block_diag(b_q, b_k, b_v)
     return out
 
 
