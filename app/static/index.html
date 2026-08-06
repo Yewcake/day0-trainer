@@ -319,7 +319,8 @@ async function showTrain(){
     </select></div>
     <div class="row" id="row-h3-quantsource" style="display:none"><label>Base checkpoint</label><select id="f_quantsource">
       <option value="bitsandbytes" selected>Self-quantized NF4 (download full model, quantize ourselves)</option>
-      <option value="comfy_convrot">Comfy-Org int8-ConvRot (matches ComfyUI's own checkpoint, smaller LoRA more likely to match community checkpoints)</option>
+      <option value="comfy_convrot">Comfy-Org int8-ConvRot, non-pruned (full architecture, needs a large GPU to run inference too)</option>
+      <option value="comfy_convrot_pruned">Comfy-Org int8-ConvRot, pruned (smaller, what most consumer-GPU users actually run in ComfyUI)</option>
     </select></div>
     <div class="row" id="row-h3-frames" style="display:none"><label>Clip length</label>
       <select id="f_numframes">

@@ -107,22 +107,32 @@ MINIMAX_H3_TEXT_ENCODER_LAYER = 50
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 
-# Comfy-Org's own pre-quantized MiniMax-H3 release. Deliberately the NON-pruned int8-ConvRot
-# file, not "*_pruned_int8_convrot" -- confirmed by inspecting both files' real safetensors
-# headers (byte-range HTTP requests, not assumed): the pruned variant replaces adaln_proj's
-# input with an 8-dim "adaln_t_table" lookup (fed by a precomputed [1025, 8] curve buffer)
-# instead of the full model's normal 2688-dim TimestepEmbedding-MLP conditioning -- a genuinely
-# different computation graph, not just different quantization, that would require reimplementing
-# MiniMax-H3's forward pass by hand (ComfyUI's own comfy/ldm/minimax/model.py) to use correctly.
-# The non-pruned convrot file's adaln_proj is still 2688-dim (verified: blocks.0.adaln_proj.
-# linear.weight is [96768, 2688], int8-quantized, and time_embedder.proj_in/proj_out are present
-# with their normal shapes) -- same computation graph as the full model, just int8-quantized, so
-# it loads into diffusers' existing, unmodified MiniMaxH3Transformer3DModel with zero forward-pass
-# changes needed.
+# Comfy-Org's own pre-quantized MiniMax-H3 release. Two genuinely different architectures live
+# under this one repo (confirmed by inspecting both files' real safetensors headers, byte-range
+# HTTP requests, not assumed):
+#  - non-pruned ("*_int8_convrot"): adaln_proj is still 2688-dim (blocks.0.adaln_proj.linear.
+#    weight is [96768, 2688], int8-quantized) and time_embedder.proj_in/proj_out are present with
+#    their normal shapes -- same computation graph as the full model, just int8-quantized on
+#    attention/FFN, so it loads into diffusers' unmodified MiniMaxH3Transformer3DModel as-is.
+#  - pruned ("*_pruned_int8_convrot"): adaln_proj is 8-dim instead (blocks.0.adaln_proj.linear.
+#    weight is [96768, 8], and final_layer's is [10752, 8]), fed by a top-level "adaln_t_table"
+#    [1025, 8] float32 buffer via lookup+lerp instead of the full TimestepEmbedding MLP --
+#    time_embedder.proj_in/proj_out don't exist in this file at all. Everything else (quantized
+#    attention/FFN, token_refiner, boundary modules) is byte-identical in structure to the
+#    non-pruned file. This is the variant most consumer-GPU users actually run (it's roughly half
+#    the static-weight size), so load_transformer_convrot() supports both: for the pruned variant
+#    it constructs the diffusers shell with time_embed_dim=8 and swaps in a small lookup-table
+#    module (IdentityTimeProj + AdalnTableTimeEmbedder, defined inside that function) in place of
+#    self.time_proj/self.time_embedder, reproducing ComfyUI's own two-line curve lookup
+#    (comfy/ldm/minimax/model.py) rather than reimplementing the whole forward pass.
 MINIMAX_H3_CONVROT_REPO = "Comfy-Org/MiniMax-H3"
 MINIMAX_H3_CONVROT_FILES = {
     "FL2VA": "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
     "Ref2VA": "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors",
+}
+MINIMAX_H3_CONVROT_PRUNED_FILES = {
+    "FL2VA": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "Ref2VA": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
 }
 
 
@@ -222,13 +232,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--quantize_base", type=int, default=1)  # 4-bit (nf4) frozen base; ~33B model, LoRA-only fits nothing else
     # "bitsandbytes" (default): download the full model ourselves, quantize to NF4 at load time
-    # (load_transformer()) -- --quantize_base governs this path. "comfy_convrot": download
-    # Comfy-Org's own pre-quantized int8-ConvRot checkpoint instead (load_transformer_convrot()),
-    # ignoring --quantize_base entirely (that checkpoint is already quantized, there's no
-    # "unquantized" variant of it to fall back to). Matches what real community LoRAs (and
-    # ai-toolkit's own default recipe) actually target, and produces a checkpoint that loads
-    # cleanly against ComfyUI's own int8-ConvRot checkpoint without any shape mismatch.
-    parser.add_argument("--quant_source", default="bitsandbytes", choices=["bitsandbytes", "comfy_convrot"])
+    # (load_transformer()) -- --quantize_base governs this path. "comfy_convrot"/"comfy_convrot_
+    # pruned": download one of Comfy-Org's own pre-quantized int8-ConvRot checkpoints instead
+    # (load_transformer_convrot()), ignoring --quantize_base entirely (both are already quantized,
+    # there's no "unquantized" variant to fall back to). "comfy_convrot" matches the non-pruned,
+    # full-architecture checkpoint (what real community LoRAs and ai-toolkit's own default recipe
+    # target); "comfy_convrot_pruned" matches the smaller, architecturally-different checkpoint
+    # most consumer-GPU users actually run (see MINIMAX_H3_CONVROT_PRUNED_FILES' comment) -- a
+    # LoRA trained against one is not shape-compatible with the other, ComfyUI will refuse to load
+    # a mismatched pair rather than silently misbehaving.
+    parser.add_argument(
+        "--quant_source", default="bitsandbytes",
+        choices=["bitsandbytes", "comfy_convrot", "comfy_convrot_pruned"],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--caption_extension", default=".txt")
     return parser.parse_args()
@@ -643,34 +659,83 @@ _CONVROT_TOP_NORM_MAP = {"norm_out.norm": "final_layer.norm"}
 
 
 def load_transformer_convrot(args, device):
-    """Load MiniMax-H3 from Comfy-Org's own pre-quantized int8-ConvRot checkpoint instead of
-    downloading and self-quantizing the full model (see load_transformer()). Trades bitsandbytes
-    NF4 (this trainer's other path) for Comfy's own int8-ConvRot format on the attention/FFN
-    linears -- worse bits-per-parameter than NF4, but matches what the wider community actually
-    trains against (real ComfyUI checkpoints dissected earlier all target this format) and what
-    a LoRA saved from this trainer needs to shape-match to load cleanly in ComfyUI without the
-    block-diagonal QKV-fusion conversion silently producing a checkpoint that only loads against
-    a *different* base checkpoint than the one it was actually trained on.
+    """Load MiniMax-H3 from one of Comfy-Org's own pre-quantized int8-ConvRot checkpoints instead
+    of downloading and self-quantizing the full model (see load_transformer()). Trades
+    bitsandbytes NF4 (this trainer's other path) for Comfy's own int8-ConvRot format on the
+    attention/FFN linears -- worse bits-per-parameter than NF4, but matches what the wider
+    community actually trains/infers against (real ComfyUI checkpoints dissected earlier all
+    target this format) and what a LoRA saved from this trainer needs to shape-match to load
+    cleanly in ComfyUI without the block-diagonal QKV-fusion conversion silently producing a
+    checkpoint that only loads against a *different* base checkpoint than the one it was actually
+    trained on.
 
-    Deliberately the non-pruned "*_int8_convrot" file, not "*_pruned_int8_convrot" -- confirmed
-    live (byte-range HTTP header reads against both real files) that the pruned variant replaces
-    adaln_proj's normal 2688-dim TimestepEmbedding-MLP conditioning with an 8-dim lookup-table
-    mechanism ("adaln_t_table"), a genuinely different computation graph this trainer does not
-    implement. The non-pruned file keeps the full model's exact architecture (verified: its
-    adaln_proj is still 2688-dim, time_embedder.proj_in/proj_out are present with normal shapes),
-    just int8-quantized -- loads into diffusers' unmodified MiniMaxH3Transformer3DModel.
+    Branches on `args.quant_source` between two genuinely different checkpoint architectures
+    (see MINIMAX_H3_CONVROT_PRUNED_FILES' module-level comment for how this was confirmed, real
+    byte-range header reads not assumed):
+      - "comfy_convrot" (non-pruned): full architecture, adaln_proj still 2688-dim, loads into
+        diffusers' unmodified MiniMaxH3Transformer3DModel with zero forward-pass changes.
+      - "comfy_convrot_pruned": adaln_proj is 8-dim, fed by a top-level "adaln_t_table" [1025, 8]
+        lookup+lerp curve instead of the normal TimestepEmbedding MLP (which doesn't exist in
+        this checkpoint at all). The diffusers shell is constructed with time_embed_dim=8 (a real
+        constructor arg -- every adaln_proj.linear's in_features throughout the model derives
+        from it) and `self.time_proj`/`self.time_embedder` are swapped for small local modules
+        (IdentityTimeProj/AdalnTableTimeEmbedder below) that reproduce ComfyUI's own two-line
+        curve lookup (comfy/ldm/minimax/model.py) instead of reimplementing the whole forward
+        pass. Everything else -- quantized attention/FFN, token_refiner, other boundary modules
+        -- is byte-identical in structure to the non-pruned file and shares every helper below.
 
     adaln_proj is dequantized ONCE here and kept dense (not wrapped in the lazy per-forward
-    ConvRotInt8Linear used for attention/FFN) -- matches this trainer's own token_refiner
-    exclusion above and ai-toolkit's real exclude-list philosophy: keep the sensitive modulation
-    path's LoRA training against a clean, full-precision-equivalent base rather than one that's
-    re-quantized every forward pass.
+    ConvRotInt8Linear used for attention/FFN) when the checkpoint stores it quantized -- matches
+    this trainer's own token_refiner exclusion above and ai-toolkit's real exclude-list
+    philosophy: keep the sensitive modulation path's LoRA training against a clean,
+    full-precision-equivalent base rather than one that's re-quantized every forward pass. In the
+    pruned checkpoint adaln_proj is already stored dense (unquantized), so this is a plain load.
     """
     import torch
     from accelerate import init_empty_weights
     from diffusers import MiniMaxH3Transformer3DModel
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
+
+    pruned = args.quant_source == "comfy_convrot_pruned"
+
+    class IdentityTimeProj(torch.nn.Module):
+        """Stand-in for self.time_proj (normally a sinusoidal Timesteps embedding) when pruned:
+        the pruned checkpoint's adaln_t_table lookup needs the RAW timestep value (already in
+        this trainer's t=1-sigma, t=1-clean convention -- see sample_shifted_sigma()/build_row_
+        timesteps()), not a sinusoidal expansion of it, so this just passes it through unchanged.
+        Kept as a real nn.Module (not a bare function) so it drops into transformer.time_proj
+        exactly like the module it replaces."""
+
+        def forward(self, timestep: "torch.Tensor") -> "torch.Tensor":
+            return timestep
+
+    class AdalnTableTimeEmbedder(torch.nn.Module):
+        """Stand-in for self.time_embedder when pruned. Reproduces ComfyUI's own adaln_t_table
+        lookup (comfy/ldm/minimax/model.py: `pos = t.clamp(0,1)*(table.shape[0]-1); i0 =
+        pos.floor().long().clamp(max=table.shape[0]-2); lerp(table[i0], table[i0+1], pos-i0)`)
+        instead of the full TimestepEmbedding MLP, which this checkpoint doesn't ship weights for
+        at all. Keeps everything in float32 (the table's own on-disk dtype, and the same
+        precision the original model's time_embedder runs at per the non-pruned path's forward()
+        comment) -- downstream MiniMaxH3AdaLayerNormModulation/AdaLayerNormOut already cast temb
+        to their own projection's dtype internally before the matmul, so no cast is needed here.
+
+        Carries a real, frozen `.linear_1` submodule purely so diffusers' own forward() --
+        `temb.to(self.time_embedder.linear_1.weight.dtype)`, called right before invoking this
+        module -- keeps resolving a real attribute instead of crashing; the dtype it reports
+        (float32) is exactly the identity-cast this class already wants."""
+
+        def __init__(self, table: "torch.Tensor"):
+            super().__init__()
+            self.register_buffer("adaln_t_table", table)
+            self.linear_1 = torch.nn.Linear(1, 1, dtype=torch.float32, device=table.device)
+
+        def forward(self, t_vals: "torch.Tensor") -> "torch.Tensor":
+            table = self.adaln_t_table
+            pos = t_vals.to(torch.float32).clamp(0.0, 1.0) * (table.shape[0] - 1)
+            i0 = pos.floor().long().clamp(max=table.shape[0] - 2)
+            frac = (pos - i0).unsqueeze(-1)
+            return torch.lerp(table[i0], table[i0 + 1], frac)
 
     class ConvRotInt8Linear(torch.nn.Linear):
         """A frozen int8-ConvRot-quantized Linear that dequantizes fresh on every forward call
@@ -749,14 +814,17 @@ def load_transformer_convrot(args, device):
             return torch.nn.functional.linear(x, w, self.bias)
 
     dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
-    filename = MINIMAX_H3_CONVROT_FILES[args.partition]
+    filename = (MINIMAX_H3_CONVROT_PRUNED_FILES if pruned else MINIMAX_H3_CONVROT_FILES)[args.partition]
     say(f"Downloading Comfy-Org pre-quantized checkpoint ({filename})...")
     ckpt_path = hf_hub_download(MINIMAX_H3_CONVROT_REPO, filename)
 
     say("Building MiniMax-H3 transformer shell (defaults already match this checkpoint's "
         "architecture, confirmed against its real header, not assumed)...")
     with init_empty_weights():
-        transformer = MiniMaxH3Transformer3DModel()
+        # time_embed_dim=8 for the pruned checkpoint sizes every adaln_proj.linear's in_features
+        # throughout the model (main blocks + final_layer) to match its real [*, 8] weights --
+        # confirmed this is a genuine constructor arg, not something requiring a subclass.
+        transformer = MiniMaxH3Transformer3DModel(time_embed_dim=8) if pruned else MiniMaxH3Transformer3DModel()
 
     f = safe_open(ckpt_path, framework="pt", device="cpu")
     keys = set(f.keys())
@@ -853,11 +921,17 @@ def load_transformer_convrot(args, device):
     say("Populating boundary modules (video/audio patch-in, text conditioning, time embedder, "
         "output heads)...")
     for diffusers_name, comfy_prefix in _CONVROT_TOP_LINEAR_MAP.items():
+        if pruned and diffusers_name.startswith("time_embedder."):
+            # This checkpoint doesn't ship time_embedder.proj_in/proj_out at all -- adaln_t_table
+            # replaces them entirely, handled below after this loop.
+            continue
         holder, attr = resolve(transformer, diffusers_name)
         if has_quant_marker(comfy_prefix):
             # Kept dense on purpose (matches this trainer's own quantization-exclude philosophy
             # for boundary modules, see load_transformer()'s own comment) even where the
-            # checkpoint itself quantized it (adaln_proj-adjacent final_layer weights do, here).
+            # checkpoint itself quantized it (adaln_proj-adjacent final_layer weights do, in the
+            # non-pruned checkpoint; the pruned one stores final_layer.adaln_proj.linear dense
+            # already, so this branch naturally falls to load_dense_linear for it instead).
             load_dequantized_dense_linear(holder, attr, comfy_prefix)
         else:
             load_dense_linear(holder, attr, comfy_prefix)
@@ -867,6 +941,13 @@ def load_transformer_convrot(args, device):
     # rope.inv_freq is a deterministic function of rope_freq_dim/rope_theta (both config, not
     # checkpoint data) in diffusers -- confirmed real source computes it fresh, not from a stored
     # buffer, so it's identical to the checkpoint's own buffer by construction and needs no load.
+
+    if pruned:
+        say("Loading adaln_t_table lookup-curve conditioning (this checkpoint's replacement for "
+            "the full TimestepEmbedding MLP)...")
+        table = take("adaln_t_table").to(device=device, dtype=torch.float32)
+        transformer.time_proj = IdentityTimeProj()
+        transformer.time_embedder = AdalnTableTimeEmbedder(table)
 
     say(f"Populating {transformer.config.num_layers} transformer blocks (attention + FFN quantized, "
         "adaln_proj kept dense)...")
@@ -900,7 +981,14 @@ def load_transformer_convrot(args, device):
             comfy_full_prefix = f"{prefix}.{comfy_suffix}"
             holder, attr = resolve(block, diffusers_suffix)
             if diffusers_suffix == "adaln_proj.linear":
-                load_dequantized_dense_linear(holder, attr, comfy_full_prefix)  # kept dense, see function docstring
+                # Kept dense either way (see function docstring) -- quantized in the non-pruned
+                # checkpoint (needs dequantizing once), already dense in the pruned one (the
+                # pruned file never quantizes its 8-dim adaln_proj at all, confirmed via its real
+                # header: no "*.comfy_quant" marker for these keys).
+                if has_quant_marker(comfy_full_prefix):
+                    load_dequantized_dense_linear(holder, attr, comfy_full_prefix)
+                else:
+                    load_dense_linear(holder, attr, comfy_full_prefix)
             else:
                 load_quantized_linear(holder, attr, comfy_full_prefix)
         for diffusers_suffix, comfy_suffix in _CONVROT_BLOCK_NORM_MAP.items():
@@ -1303,7 +1391,8 @@ def main() -> None:
     # (both encoders resident at once) would not have fit on the same GPU as phase 2's peak either
     # way, which is the actual reason these are two separate phases, not one combined estimate.
     transformer = (
-        load_transformer_convrot(args, device) if args.quant_source == "comfy_convrot"
+        load_transformer_convrot(args, device)
+        if args.quant_source in ("comfy_convrot", "comfy_convrot_pruned")
         else load_transformer(args, device)
     )
     transformer = inject_lora(transformer, args.rank, args.lora_alpha)
