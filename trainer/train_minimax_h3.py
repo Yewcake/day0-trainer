@@ -523,46 +523,10 @@ def _dequantize_convrot_int8(
     """qdata: int8 (out_features, in_features), the rotated weight's per-row-symmetric int8
     codes. scale: per-output-row fp32 scale (out_features,) -- max(abs(rotated_row))/127 at
     quantize time. Returns the dense, de-rotated weight in `dtype`."""
+    import torch
+
     w_rotated = qdata.to(torch.float32) * scale.reshape(-1, 1).to(torch.float32)
     return _convrot_rotate(w_rotated, rot_size).to(dtype)
-
-
-class ConvRotInt8Linear(torch.nn.Linear):
-    """A frozen int8-ConvRot-quantized Linear that dequantizes fresh on every forward call
-    under no_grad, instead of ai-toolkit's own QAT-capable custom-autograd machinery
-    (straight-through estimators, Triton kernels) -- that machinery exists so gradients CAN
-    flow into the quantized weights themselves for quantization-aware fine-tuning. We don't
-    need that: this is standard LoRA training, the base weight is frozen either way, and
-    PyTorch's autograd already backprops correctly through a plain F.linear w.r.t. the
-    *input* (what a LoRA adapter's gradient path actually needs) without any custom backward,
-    exactly like bitsandbytes' own Linear4bit/Linear8bitLt already do in this same trainer's
-    other loading path.
-
-    No real `.weight` Parameter is kept (mirrors ai-toolkit's own `_to_ostris()` pattern:
-    `del module._parameters["weight"]`) -- verified safe against real peft source before
-    relying on it, not assumed: LoraLayer.update_layer() (the code that creates lora_A/lora_B
-    for a target module) only reads `self.in_features`/`self.out_features` for sizing, and
-    only touches `base_layer.weight` inside the pissa/olora/loftq/corda init-scheme branches,
-    none of which this trainer uses (inject_lora() passes init_lora_weights="gaussian").
-    Forward delegation is `self.base_layer(x)` -- calls this class's own forward() directly,
-    never reads `.weight`. isinstance(module, torch.nn.Linear) is what inject_lora() checks to
-    build its target list, and this class satisfies that by real inheritance, not duck-typing."""
-
-    def __init__(self, qdata, scale, rot_size: int, bias, compute_dtype):
-        out_features, in_features = qdata.shape
-        super().__init__(in_features, out_features, bias=bias is not None, device="meta")
-        del self._parameters["weight"]
-        if bias is not None:
-            self.bias = torch.nn.Parameter(bias.to(compute_dtype), requires_grad=False)
-        self.register_buffer("cr8_qdata", qdata, persistent=False)
-        self.register_buffer("cr8_scale", scale.reshape(-1).to(torch.float32), persistent=False)
-        self.cr8_rot_size = rot_size
-        self.compute_dtype = compute_dtype
-
-    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        with torch.no_grad():
-            w = _dequantize_convrot_int8(self.cr8_qdata, self.cr8_scale, self.cr8_rot_size, self.compute_dtype)
-        return torch.nn.functional.linear(x, w, self.bias)
 
 
 def load_transformer(args, device):
@@ -707,6 +671,51 @@ def load_transformer_convrot(args, device):
     from diffusers import MiniMaxH3Transformer3DModel
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
+
+    class ConvRotInt8Linear(torch.nn.Linear):
+        """A frozen int8-ConvRot-quantized Linear that dequantizes fresh on every forward call
+        under no_grad, instead of ai-toolkit's own QAT-capable custom-autograd machinery
+        (straight-through estimators, Triton kernels) -- that machinery exists so gradients CAN
+        flow into the quantized weights themselves for quantization-aware fine-tuning. We don't
+        need that: this is standard LoRA training, the base weight is frozen either way, and
+        PyTorch's autograd already backprops correctly through a plain F.linear w.r.t. the
+        *input* (what a LoRA adapter's gradient path actually needs) without any custom backward,
+        exactly like bitsandbytes' own Linear4bit/Linear8bitLt already do in this same trainer's
+        other loading path.
+
+        Defined nested inside load_transformer_convrot() rather than at module level -- this file
+        deliberately never imports torch at module level (PYTORCH_CUDA_ALLOC_CONF must be set
+        before torch's own first import to take effect, see the top of this file), and a
+        module-level `class Foo(torch.nn.Linear)` evaluates its base class at import time, before
+        any function (including this one) has run. Nesting it here means its methods resolve
+        `torch` through the closure over this function's own `import torch` above, no separate
+        import needed inside __init__/forward.
+
+        No real `.weight` Parameter is kept (mirrors ai-toolkit's own `_to_ostris()` pattern:
+        `del module._parameters["weight"]`) -- verified safe against real peft source before
+        relying on it, not assumed: LoraLayer.update_layer() (the code that creates lora_A/lora_B
+        for a target module) only reads `self.in_features`/`self.out_features` for sizing, and
+        only touches `base_layer.weight` inside the pissa/olora/loftq/corda init-scheme branches,
+        none of which this trainer uses (inject_lora() passes init_lora_weights="gaussian").
+        Forward delegation is `self.base_layer(x)` -- calls this class's own forward() directly,
+        never reads `.weight`. isinstance(module, torch.nn.Linear) is what inject_lora() checks to
+        build its target list, and this class satisfies that by real inheritance, not duck-typing."""
+
+        def __init__(self, qdata, scale, rot_size: int, bias, compute_dtype):
+            out_features, in_features = qdata.shape
+            super().__init__(in_features, out_features, bias=bias is not None, device="meta")
+            del self._parameters["weight"]
+            if bias is not None:
+                self.bias = torch.nn.Parameter(bias.to(compute_dtype), requires_grad=False)
+            self.register_buffer("cr8_qdata", qdata, persistent=False)
+            self.register_buffer("cr8_scale", scale.reshape(-1).to(torch.float32), persistent=False)
+            self.cr8_rot_size = rot_size
+            self.compute_dtype = compute_dtype
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            with torch.no_grad():
+                w = _dequantize_convrot_int8(self.cr8_qdata, self.cr8_scale, self.cr8_rot_size, self.compute_dtype)
+            return torch.nn.functional.linear(x, w, self.bias)
 
     dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
     filename = MINIMAX_H3_CONVROT_FILES[args.partition]
