@@ -755,10 +755,17 @@ def load_transformer_convrot(args, device):
 
     def dequantize_dense(prefix: str, out_dtype) -> "torch.Tensor":
         """For modules we deliberately keep dense (adaln_proj) even though the checkpoint
-        stores them quantized -- dequantize once here rather than wrapping in ConvRotInt8Linear."""
+        stores them quantized -- dequantize once here rather than wrapping in ConvRotInt8Linear.
+
+        qdata/scale are moved to `device` BEFORE dequantizing, not after -- safe_open() hands
+        back CPU tensors, and every other loader path here moves to device first for exactly
+        this reason: the dequant is a real matmul (the Hadamard rotation), and adaln_proj's is
+        big (96768x2688). Doing that on CPU instead of GPU is correct either way (set_param()
+        would move the final result to device regardless) but silently adds real, avoidable
+        minutes to every load across 51 of these (50 blocks + final_layer)."""
         conf = _parse_comfy_quant_blob(take(f"{prefix}.comfy_quant"))
-        qdata = take(f"{prefix}.weight")
-        scale = take(f"{prefix}.weight_scale")
+        qdata = take(f"{prefix}.weight").to(device)
+        scale = take(f"{prefix}.weight_scale").to(device)
         rot = int(conf.get("convrot_groupsize", 256)) if conf.get("convrot") else 1
         return _dequantize_convrot_int8(qdata, scale, rot, out_dtype)
 
