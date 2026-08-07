@@ -503,11 +503,23 @@ const PROVEN_SETTINGS = {
     f_rank: '32', f_factor: '4', f_fullrank: '1', f_decompose: '0', f_res: '1024',
     f_optimizer: 'automagic', f_lr: '5e-5', f_wd: '0.01', f_gc: '1',
   },
+  // Rank 16 (not the shared default 32) matches both a real dissected community checkpoint
+  // (hmmotion_minimax-h3, rank 16 confirmed straight from its lora_A/lora_B tensor shapes) and
+  // Fizgig's (github.com/shootthesound/Fizgig) own shipped MiniMax H3 defaults (dim/alpha 16) --
+  // two independent working references, not a guess. H3 has no LoKr adapter (see noLokr in
+  // onModelChange()), so this is the only preset it ever needs regardless of the Network dropdown.
+  minimax_h3: {
+    f_rank: '16', f_res: '1024', f_optimizer: 'paged_adamw8bit',
+    f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
+  },
 };
 const LOCKED_FIELD_IDS = ['f_rank','f_factor','f_fullrank','f_decompose','f_res','f_optimizer','f_lr','f_wd','f_gc'];
 
 function applyProvenSettings(){
-  const preset = PROVEN_SETTINGS[$('#f_network').value];
+  const models = window._models || [];
+  const entry = models.find(m => m.id === $('#f_model').value);
+  const isH3 = !!entry && entry.arch === 'minimax_h3';
+  const preset = PROVEN_SETTINGS[isH3 ? 'minimax_h3' : $('#f_network').value];
   for (const [id, val] of Object.entries(preset)){
     const el = $('#'+id);
     if (el) el.value = val;
