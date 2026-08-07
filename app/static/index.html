@@ -282,6 +282,9 @@ async function showTrain(){
     </div>
     <div id="advanced-fields">
       <div class="row"><label>Rank</label><input id="f_rank" type="number" value="32"></div>
+      <div class="row" id="row-h3-alpha" style="display:none"><label>LoRA alpha</label><input id="f_loraalpha" type="number" value="32"></div>
+      <div class="row" id="row-h3-guidance" style="display:none"><label>Guidance distillation</label><input id="f_h3guidance" type="number" step="0.1" value="3"></div>
+      <div class="row" id="row-h3-preserve" style="display:none"><label>Base preservation</label><input id="f_h3preserve" type="number" step="0.01" value="0.05"></div>
       <div class="row lokr-only"><label>LoKr factor</label><select id="f_factor">
         <option value="-1" selected>Auto</option>
         <option value="4">4</option>
@@ -314,13 +317,13 @@ async function showTrain(){
       </div>
     </div>
     <div class="row" id="row-h3-partition" style="display:none"><label>Partition</label><select id="f_partition">
-      <option value="FL2VA" selected>FL2VA — plain text/image-to-video (no reference identity)</option>
+      <option value="FL2VA" selected>T2V / FL2VA — text-conditioned training</option>
       <option value="Ref2VA">Ref2VA — reference-image-conditioned (use with a subject's reference images)</option>
     </select></div>
     <div class="row" id="row-h3-quantsource" style="display:none"><label>Base checkpoint</label><select id="f_quantsource">
-      <option value="bitsandbytes" selected>Self-quantized NF4 (download full model, quantize ourselves)</option>
-      <option value="comfy_convrot">Comfy-Org int8-ConvRot, non-pruned (full architecture, needs a large GPU to run inference too)</option>
-      <option value="comfy_convrot_pruned">Comfy-Org int8-ConvRot, pruned (smaller, what most consumer-GPU users actually run in ComfyUI)</option>
+      <option value="bitsandbytes" selected>Base (official weights, NF4 during training)</option>
+      <option value="comfy_convrot">ConvRot (full architecture)</option>
+      <option value="comfy_convrot_pruned">ConvRot Pruned (smaller timestep/AdaLN path)</option>
     </select></div>
     <div class="row" id="row-h3-frames" style="display:none"><label>Clip length</label>
       <select id="f_numframes">
@@ -413,7 +416,10 @@ function onModelChange(){
     if (tf) tf.checked = false;
   }
 
-  ['row-h3-partition', 'row-h3-quantsource', 'row-h3-frames', 'row-h3-shortedge', 'row-h3-audio'].forEach(id => { const el = $('#'+id); if (el) el.style.display = isH3 ? '' : 'none'; });
+  ['row-h3-partition', 'row-h3-quantsource', 'row-h3-frames', 'row-h3-shortedge', 'row-h3-audio',
+   'row-h3-alpha', 'row-h3-guidance', 'row-h3-preserve'].forEach(id => {
+    const el = $('#'+id); if (el) el.style.display = isH3 ? '' : 'none';
+  });
   ['row-resolution', 'row-optimizer', 'row-sample-every', 'row-sample-prompts',
    'row-autoanalyze', 'row-valimage', 'row-valprompt'].forEach(id => {
     const el = $('#'+id); if (el) el.style.display = isH3 ? 'none' : '';
@@ -421,6 +427,8 @@ function onModelChange(){
   if (isH3){
     const auto = $('#f_autoanalyze'); if (auto) auto.checked = false;
   }
+  if (!$('#f_unlock').checked) applyProvenSettings();
+  updateScheduleDisplay();
 }
 
 // All three trainers now support cosine/constant/linear (--lr_scheduler), warmup always ramps
@@ -429,9 +437,12 @@ function onModelChange(){
 // exception (no warmup ramp at all, see train_ideogram4.py's own comment on that).
 function updateScheduleDisplay(){
   const steps = parseInt($('#f_steps')?.value) || 0;
+  const entry = (window._models || []).find(m => m.id === $('#f_model')?.value);
+  const isH3 = !!entry && entry.arch === 'minimax_h3';
   const warmup = Math.max(1, Math.round(steps * 0.05));
   const el = $('#f_schedule_hint');
-  if (el) el.textContent = steps ? `Warmup: ${warmup} steps (5% of ${steps})` : 'Warmup: 5% of steps';
+  if (el) el.textContent = isH3 ? 'Warmup: 0 steps (MiniMax-H3 reference recipe)'
+    : (steps ? `Warmup: ${warmup} steps (5% of ${steps})` : 'Warmup: 5% of steps');
 }
 
 function applyTriggerToPrompts(){
@@ -497,23 +508,21 @@ async function onValidationImageChange(){
 const PROVEN_SETTINGS = {
   lora: {
     f_rank: '32', f_res: '1024', f_optimizer: 'paged_adamw8bit',
-    f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
+    f_schedule: 'cosine', f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
   },
   lokr: {
     f_rank: '32', f_factor: '4', f_fullrank: '1', f_decompose: '0', f_res: '1024',
-    f_optimizer: 'automagic', f_lr: '5e-5', f_wd: '0.01', f_gc: '1',
+    f_optimizer: 'automagic', f_schedule: 'cosine', f_lr: '5e-5', f_wd: '0.01', f_gc: '1',
   },
-  // Rank 16 (not the shared default 32) matches both a real dissected community checkpoint
-  // (hmmotion_minimax-h3, rank 16 confirmed straight from its lora_A/lora_B tensor shapes) and
-  // Fizgig's (github.com/shootthesound/Fizgig) own shipped MiniMax H3 defaults (dim/alpha 16) --
-  // two independent working references, not a guess. H3 has no LoKr adapter (see noLokr in
-  // onModelChange()), so this is the only preset it ever needs regardless of the Network dropdown.
+  // Reference-compatible H3 recipe, matched to the inspected working v1 adapter. The native
+  // adapter saves BF16 by default, so rank 64 is roughly 596 MB instead of the 1.19 GB FP32 file.
   minimax_h3: {
-    f_rank: '16', f_res: '1024', f_optimizer: 'paged_adamw8bit',
+    f_rank: '64', f_loraalpha: '32', f_h3guidance: '3', f_h3preserve: '0.05',
+    f_res: '1024', f_optimizer: 'paged_adamw8bit', f_schedule: 'constant',
     f_lr: '1e-4', f_wd: '0.01', f_gc: '1',
   },
 };
-const LOCKED_FIELD_IDS = ['f_rank','f_factor','f_fullrank','f_decompose','f_res','f_optimizer','f_lr','f_wd','f_gc'];
+const LOCKED_FIELD_IDS = ['f_rank','f_loraalpha','f_h3guidance','f_h3preserve','f_factor','f_fullrank','f_decompose','f_res','f_optimizer','f_schedule','f_lr','f_wd','f_gc'];
 
 function applyProvenSettings(){
   const models = window._models || [];
@@ -560,6 +569,7 @@ async function submitJob(ev){
     model_id: $('#f_model').value, dataset: $('#f_dataset').value, trigger_word: trigger,
     hf_token: $('#f_hf').value.trim(), save_hf_token: $('#f_hf_save').checked,
     network_type: $('#f_network').value, rank:+$('#f_rank').value,
+    lora_alpha:+$('#f_loraalpha').value,
     lokr_factor:+$('#f_factor').value, lokr_full_rank:+$('#f_fullrank').value,
     lokr_decompose_both:+$('#f_decompose').value,
     resolution:+$('#f_res').value, steps:+$('#f_steps').value,
@@ -573,6 +583,8 @@ async function submitJob(ev){
     masterchef_enabled: $('#f_masterchef').checked,
     include_text_fusion: $('#f_include_text_fusion').checked,
     partition: $('#f_partition').value, quant_source: $('#f_quantsource')?.value || 'bitsandbytes',
+    guidance_distillation_scale:+$('#f_h3guidance').value,
+    base_preservation_loss_weight:+$('#f_h3preserve').value,
     num_frames:+$('#f_numframes').value,
     short_edge:+$('#f_shortedge').value,
     train_audio: $('#f_trainaudio')?.checked || false,

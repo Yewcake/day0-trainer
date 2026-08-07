@@ -1,6 +1,6 @@
 # Day0 Trainer: Krea 2 / Ideogram 4 / MiniMax H3 LoRA Trainer, by Yewcake
 
-Universal direct Diffusers + PEFT trainer with a web UI. New models plug in via `models.json` + a trainer adapter. Runs as a RunPod template.
+Multi-model Diffusers trainer with a web UI. New models plug in via `models.json` + a trainer adapter. Runs as a RunPod template.
 
 <p align="center">
   <img src="docs/images/sample-1.jpg" alt="Day0 Trainer sample output 1" width="45%">
@@ -27,6 +27,22 @@ Universal direct Diffusers + PEFT trainer with a web UI. New models plug in via 
 - Gemini checkpoint analysis: sends the loss curve + one sample per checkpoint, returns best-candidate verdict
 - Settings page for Hugging Face token (model downloads) and Gemini API key
 - Light + dark mode, soft purple theme
+
+## MiniMax H3
+
+MiniMax H3 exposes a 3 × 2 training matrix in the UI:
+
+- Base, ConvRot, or ConvRot Pruned frozen weights
+- T2V / FL2VA or Ref2VA partition
+
+All six combinations use the same native-rank adapter: fused `qkv_proj`, `out_proj`,
+`mlp.fc1`, and `mlp.fc2` in each of the 50 main blocks. AdaLN and token-refiner
+layers are not trained. The reference preset is rank 64 / alpha 32 with uniform
+timestep sampling, constant LR, guidance distillation 3.0, and base preservation
+0.05.
+
+H3 checkpoints save matrices as BF16 by default. Approximate file sizes are 596 MB
+at rank 64, 298 MB at rank 32, and 149 MB at rank 16. Alpha tensors remain FP32.
 
 
 ## How updates work
@@ -70,6 +86,7 @@ models.json                 model registry (label, arch, trainer script, network
 trainer/train_krea2_lora_direct.py   Krea 2 trainer (LoRA + LoKr)
 trainer/train_ideogram4.py           Ideogram 4 trainer (LoRA, diffusion-pipe)
 trainer/train_minimax_h3.py          MiniMax H3 trainer (LoRA, video, experimental)
+trainer/minimax_h3_lora.py           native H3 adapter + ComfyUI/Kohya exporter
 ```
 
 ## Job output
@@ -81,7 +98,8 @@ config.json           form snapshot
 log.txt               full trainer output
 run/metrics.jsonl     per-step loss/lr, the UI chart reads this
 run/samples/step-*/   sample images per checkpoint
-run/checkpoints/*/krea2_comfy_native_lora.safetensors   ComfyUI-ready file
+run/checkpoints/*/krea2_comfy_native_lora.safetensors   Krea/Ideogram ComfyUI-ready file
+run/checkpoints/*/minimax_h3_lora.safetensors            MiniMax H3 ComfyUI-ready file
 ```
 
 The exported `.safetensors` loads in ComfyUI's standard LoRA loader for both network types. Use strength ~1.35 for LoRA runs, 1.0 for LoKr runs.
@@ -89,5 +107,5 @@ The exported `.safetensors` loads in ComfyUI's standard LoRA loader for both net
 ## Notes
 
 - One job at a time (one GPU per pod). The API refuses a second concurrent job.
-- Datasets are zips of images with matching `.txt` caption files; uploaded via the UI to `/workspace/datasets/<name>/`.
+- Image models use images with matching `.txt` captions; MiniMax H3 uses video clips with matching `.txt` captions.
 - The CLI launcher `Train_Krea2_Direct_Diffusers.sh` still works over SSH for headless runs; the UI and CLI share the same trainer script.

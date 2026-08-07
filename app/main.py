@@ -1344,12 +1344,22 @@ def create_job(payload: dict) -> dict:
         "masterchef_enabled": False, "include_text_fusion": False,
         "partition": "FL2VA", "quant_source": "bitsandbytes", "num_frames": 73, "short_edge": 768,
         "train_audio": False, "audio_loss_weight": 1.0,
+        "lora_alpha": 32, "guidance_distillation_scale": 3.0,
+        "base_preservation_loss_weight": 0.05, "timestep_sampling": "uniform",
+        "save_dtype": "bfloat16",
         "lr_scheduler": "cosine",
         "seed": 42,
     }
+    if model_entry["arch"] == "minimax_h3":
+        defaults.update({"rank": 64, "lora_alpha": 32, "lr_scheduler": "constant"})
     config = {**defaults, **{k: payload[k] for k in defaults if k in payload}}
+    if model_entry["arch"] == "minimax_h3" and "lora_alpha" not in payload:
+        config["lora_alpha"] = max(1, int(config["rank"]) // 2)
     # 5% warmup matches the proven lora recipe (150 steps for a 3000-step run); scales with step count.
-    config["warmup_steps"] = int(payload["warmup_steps"]) if "warmup_steps" in payload else max(1, round(int(config["steps"]) * 0.05))
+    if model_entry["arch"] == "minimax_h3":
+        config["warmup_steps"] = int(payload.get("warmup_steps", 0))
+    else:
+        config["warmup_steps"] = int(payload["warmup_steps"]) if "warmup_steps" in payload else max(1, round(int(config["steps"]) * 0.05))
     config.update({
         "dataset": dataset, "trigger_word": trigger, "network_type": network,
         "model_id": model_id, "model_label": model_entry["label"], "sample_prompts": prompts,
@@ -1382,7 +1392,7 @@ def create_job(payload: dict) -> dict:
             "--seed", str(config["seed"]),
         ]
     elif model_entry["arch"] == "minimax_h3":
-        # A third, distinct framework: our own direct diffusers+PEFT loop (like Krea2 below), but
+        # A third, distinct framework: our own Diffusers loop with a native-rank H3 adapter, but
         # against MiniMax-H3's own component layout -- --partition selects which of the two separate
         # ~33B checkpoints (FL2VA vs Ref2VA) this LoRA targets, see train_minimax_h3.py's own
         # docstring for why those aren't interchangeable. --output_dir/--run_name follow the same
@@ -1400,11 +1410,15 @@ def create_job(payload: dict) -> dict:
             "--short_edge", str(config["short_edge"]),
             "--max_train_steps", str(config["steps"]),
             "--save_every_n_steps", str(config["save_every"]),
-            "--rank", str(rank), "--lora_alpha", str(rank),
+            "--rank", str(rank), "--lora_alpha", str(config["lora_alpha"]),
             "--learning_rate", str(config["learning_rate"]),
             "--weight_decay", str(config["weight_decay"]),
             "--lr_warmup_steps", str(config["warmup_steps"]),
             "--lr_scheduler", str(config["lr_scheduler"]),
+            "--guidance_distillation_scale", str(config["guidance_distillation_scale"]),
+            "--base_preservation_loss_weight", str(config["base_preservation_loss_weight"]),
+            "--timestep_sampling", str(config["timestep_sampling"]),
+            "--save_dtype", str(config["save_dtype"]),
             "--train_batch_size", str(config["batch_size"]),
             "--gradient_checkpointing", str(config["gradient_checkpointing"]),
             "--train_audio", "1" if config["train_audio"] else "0",
@@ -1592,7 +1606,9 @@ def job_checkpoints(job_id: str) -> list[dict]:
     out = []
     if checkpoints_root.is_dir():
         for step_folder in sorted(checkpoints_root.iterdir()):
-            native = step_folder / "krea2_comfy_native_lora.safetensors"
+            native = step_folder / "minimax_h3_lora.safetensors"
+            if not native.is_file():
+                native = step_folder / "krea2_comfy_native_lora.safetensors"
             if native.is_file():
                 out.append({"step": step_folder.name, "size_mb": round(native.stat().st_size / 1e6, 1)})
     return out
@@ -1600,7 +1616,10 @@ def job_checkpoints(job_id: str) -> list[dict]:
 
 @app.get("/api/jobs/{job_id}/checkpoints/{step}/download", dependencies=[Depends(require_auth)])
 def download_checkpoint(job_id: str, step: str) -> FileResponse:
-    path = job_dir(job_id) / "run" / "checkpoints" / safe_name(step) / "krea2_comfy_native_lora.safetensors"
+    checkpoint_dir = job_dir(job_id) / "run" / "checkpoints" / safe_name(step)
+    path = checkpoint_dir / "minimax_h3_lora.safetensors"
+    if not path.is_file():
+        path = checkpoint_dir / "krea2_comfy_native_lora.safetensors"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Checkpoint not found.")
     config = json.loads((job_dir(job_id) / "config.json").read_text())

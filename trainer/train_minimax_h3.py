@@ -1,4 +1,4 @@
-"""MiniMax-H3 LoRA trainer -- direct diffusers + PEFT, style/motion LoRAs.
+"""MiniMax-H3 LoRA trainer -- native-rank adapters on the Diffusers model port.
 
 STATUS: first draft, written directly against MiniMax-H3's real source (the
 `minimax-h3` branch of huggingface/diffusers, not yet merged/released to PyPI)
@@ -63,9 +63,9 @@ ARCHITECTURE FACTS THIS FILE DEPENDS ON (read from source, cited inline where
 they're used):
 - transformer_minimax_h3.py: one packed 1-D self-attention sequence carries
   text + audio + video rows through 50 shared transformer_blocks (no
-  cross-attention anywhere, no per-modality block weights). Already inherits
-  PeftAdapterMixin and has @apply_lora_scale wired into forward() -- standard
-  diffusers/PEFT LoRA injection works directly, no custom PEFT plumbing needed.
+  cross-attention anywhere, no per-modality block weights). Diffusers exposes
+  split Q/K/V linears, so this trainer uses a shared-down custom adapter to
+  preserve the released model's fused-QKV rank at export.
 - scheduling_minimax_h3.py: rectified flow, but with MiniMax-H3's own
   conventions -- t = 1 - sigma (t=1 clean), and the transformer predicts a
   *data-ward* velocity (x0 = x_t + (1-t)*v, the sign-reversed opposite of
@@ -180,7 +180,7 @@ def setup_environment() -> None:
     # and not worth the ABI-mismatch risk of force-upgrading it alongside a pinned torch build.
     run([
         sys.executable, "-m", "pip", "install", "-q", "--upgrade",
-        "transformers", "peft>=0.13", "accelerate", "av", "bitsandbytes",
+        "transformers", "accelerate", "av", "bitsandbytes",
     ])
 
 
@@ -214,12 +214,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short_edge", type=int, default=768)
     parser.add_argument("--max_train_steps", type=int, default=2000)
     parser.add_argument("--save_every_n_steps", type=int, default=250)
-    parser.add_argument("--rank", type=int, default=32)
+    parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--lr_warmup_steps", type=int, default=100)
-    parser.add_argument("--lr_scheduler", default="cosine", choices=["cosine", "constant", "linear"])
+    parser.add_argument("--lr_warmup_steps", type=int, default=0)
+    parser.add_argument("--lr_scheduler", default="constant", choices=["cosine", "constant", "linear"])
     # The training loop pulls one cached (clip, caption) pair per step -- batching multiple clips of
     # different aspect ratios/lengths into one packed layout isn't implemented, so this is accepted
     # (main.py's job form has a general Batch size field) but enforced to be 1, not silently ignored.
@@ -229,6 +229,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio_shift", type=float, default=3.0)  # MiniMax-H3's own default for audio rows
     parser.add_argument("--train_audio", type=int, default=0)  # 0 = video+text only; see module docstring
     parser.add_argument("--audio_loss_weight", type=float, default=1.0)  # matches ss_h3_audio_loss_weight: 1 convention
+    parser.add_argument("--guidance_distillation_scale", type=float, default=3.0)
+    parser.add_argument("--base_preservation_loss_weight", type=float, default=0.05)
+    parser.add_argument("--timestep_sampling", default="uniform", choices=["uniform", "logit_normal"])
+    parser.add_argument("--save_dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--resume_lora", default="")
     parser.add_argument("--base_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--quantize_base", type=int, default=1)  # 4-bit (nf4) frozen base; ~33B model, LoRA-only fits nothing else
     # "bitsandbytes" (default): download the full model ourselves, quantize to NF4 at load time
@@ -570,10 +575,9 @@ def load_transformer(args, device):
     # tensor at all. diffusers already flags proj_in/audio_proj_in/time_embedder/proj_out/
     # audio_proj_out as _keep_in_fp32_modules for exactly this reason -- context_embedder,
     # adaln_proj (all 50 of them) and norm_out do the identical pattern but were missed from that
-    # list, so they'd hit this same crash the moment training reached them. context_embedder and
-    # norm_out aren't LoRA targets (only transformer_blocks.*.attn.*/.ff.*/.adaln_proj.linear and
-    # token_refiner.refiner_blocks.*.attn.*/.ff.* are, see inject_lora()) -- but adaln_proj is NOT
-    # a small exclusion: each block's is a (2688 -> 6*5376*3) linear, ~260M params, and there are
+    # list, so they'd hit this same crash the moment training reached them. These boundary/AdaLN
+    # modules are no longer LoRA targets, but adaln_proj is NOT a small quantization exclusion:
+    # each block's is a (2688 -> 6*5376*3) linear, ~260M params, and there are
     # 50 of them -- ~13B params, ~40% of the model's 33B total, staying in bf16 (2 bytes) instead
     # of int8. That's a real, meaningful jump in static memory (roughly 46GB total transformer
     # weights instead of ~33GB fully quantized), not a rounding error -- still fits an 80GB GPU
@@ -591,16 +595,13 @@ def load_transformer(args, device):
     # weight.dtype self-referential cast, so quantizing them wasn't unsafe, just previously unhelpful
     # to change without knowing whether it'd be enough.
     #
-    # token_refiner added here after cross-checking ai-toolkit's own MiniMax-H3 extension's
+    # token_refiner remains excluded after cross-checking ai-toolkit's own MiniMax-H3 extension's
     # get_quantization_exclude_modules() line by line against this list (every other name matches
     # 1:1 once accounting for diffusers-vs-native naming -- video_patch_proj/audio_patch_proj =
     # proj_in/audio_proj_in, condition_proj = context_embedder, final_layer = proj_out+norm_out --
     # confirmed against the real diffusers __init__ attribute names, not assumed). token_refiner was
-    # the one real gap: it's a LoRA target here (inject_lora() trains token_refiner.refiner_blocks.*)
-    # but wasn't excluded from quantization, meaning that LoRA was being trained against a quantized
-    # frozen base while ai-toolkit trains it against a full-precision one. token_refiner preprocesses
-    # every text token before it ever reaches the main transformer_blocks, so a noisier frozen base
-    # there has more reach than a typical single attention/FF layer would.
+    # the one real gap in the original loader. It is frozen now, but it preprocesses every text token
+    # before the main blocks, so preserving the reference implementation's precision remains useful.
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -756,48 +757,16 @@ def load_transformer_convrot(args, device):
         `torch` through the closure over this function's own `import torch` above, no separate
         import needed inside __init__/forward.
 
-        `.weight` is kept as a TINY (shape (1,)) real Parameter on the real device, not a
-        full-size meta placeholder and not deleted -- two live/local findings shaped this,
-        in order: (1) deleting it (mirroring ai-toolkit's own `_to_ostris()` pattern, `del
-        module._parameters["weight"]`) crashes PEFT -- LoraLayer.__init__ calls peft's
-        `_get_in_out_features()`, which for any nn.Linear reads `module.weight` first (an
-        isinstance(..., DTensor) check for tensor-parallel support, unrelated to us) before
-        falling through to `module.in_features`/`out_features` -- so `.weight` must exist and
-        be accessible. (2) Leaving it on the *meta* device (real existence, wrong device) is
-        ALSO wrong, caught only via a local CPU repro of this exact injection path outside the
-        real 33B model: PEFT's `_move_adapter_to_device_of_base_layer()` reads
-        `base_layer.weight.device` to decide where to place the newly-created lora_A/lora_B --
-        so a meta `.weight` silently moved the real, Gaussian-initialized LoRA parameters to
-        meta too, discarding their init values (confirmed: lora_A/lora_B ended up device=meta
-        after injection, and backward failed with "MmBackward0 returned an invalid gradient
-        ... expected device meta but got cpu"). `_get_in_out_features()` never reads `.weight`'s
-        *shape* for a plain non-DTensor nn.Linear, only its existence/dtype, so a tiny stand-in
-        on the real device satisfies both constraints at once, at negligible memory cost.
-        Separately, LoraLayer.update_layer() (the code that creates lora_A/lora_B) only reads
-        `self.in_features`/`self.out_features` for sizing, and only touches `base_layer.weight`'s
-        VALUES inside the pissa/olora/loftq/corda init-scheme branches, none of which this
-        trainer uses (inject_lora() passes init_lora_weights="gaussian").
-        Forward delegation is `self.base_layer(x)` -- calls this class's own forward() directly,
-        never reads `.weight`. isinstance(module, torch.nn.Linear) is what inject_lora() checks to
-        build its target list, and this class satisfies that by real inheritance, not duck-typing."""
+        `.weight` is kept as a TINY (shape (1,)) frozen Parameter on the real device rather than
+        a full dense weight. The native LoRA wrapper sizes itself from in_features/out_features,
+        uses this real tensor to discover the device, and delegates base inference to forward(),
+        which reads cr8_qdata/cr8_scale instead of the placeholder value."""
 
         def __init__(self, qdata, scale, rot_size: int, bias, compute_dtype):
             out_features, in_features = qdata.shape
             super().__init__(in_features, out_features, bias=bias is not None, device="meta")
-            # .weight must exist (LoraLayer.__init__ -> peft's _get_in_out_features() reads
-            # `module.weight` before falling through to module.in_features/out_features -- see
-            # the class docstring), but it must NOT be on the meta device, discovered only via a
-            # local CPU repro (no GPU/checkpoint needed) of the exact PEFT injection path: PEFT's
-            # BaseTunerLayer._move_adapter_to_device_of_base_layer() reads base_layer.weight.device
-            # to decide where to place the newly-created lora_A/lora_B -- so leaving .weight on
-            # meta silently moved the real, Gaussian-initialized LoRA parameters to meta too,
-            # discarding their init values in the process (confirmed: lora_A/lora_B.weight.device
-            # was "meta" after injection, and backward failed with "MmBackward0 returned an
-            # invalid gradient ... expected device meta but got cpu"). Fixed with a TINY (shape
-            # (1,)) real tensor on the real device instead of a full-size meta placeholder --
-            # _get_in_out_features() never reads .weight's shape for a plain (non-DTensor)
-            # nn.Linear, only its existence and dtype, so the true (out, in) shape was never
-            # needed here in the first place.
+            # Keep a real-device placeholder so generic device discovery never follows the
+            # init_empty_weights() meta tensor. The true dimensions remain in in/out_features.
             self.weight = torch.nn.Parameter(
                 torch.zeros(1, device=qdata.device, dtype=compute_dtype), requires_grad=False
             )
@@ -1056,11 +1025,9 @@ def load_transformer_convrot(args, device):
             f"diffusers-to-Comfy name mapping is missing something: {unconsumed[:20]}"
             + (" ..." if len(unconsumed) > 20 else "")
         )
-    # ConvRotInt8Linear.weight is EXPECTED to stay on the meta device forever (see that class's
-    # own docstring) -- it's a placeholder kept only so peft's _get_in_out_features() has
-    # something to access, real data lives in cr8_qdata/cr8_scale instead. Exempt it by identity
-    # (module type + param name), not by pattern-matching the name string, so this still catches
-    # a genuinely unpopulated ".weight" anywhere else.
+    # Older checkpoints/loaders may still leave ConvRotInt8Linear's unused placeholder on meta;
+    # real data lives in cr8_qdata/cr8_scale. Exempt only that identity while still catching any
+    # genuinely unpopulated model tensor.
     still_meta = []
     for mod_name, module in transformer.named_modules():
         is_convrot = isinstance(module, ConvRotInt8Linear)
@@ -1087,67 +1054,35 @@ def load_transformer_convrot(args, device):
 
 
 def inject_lora(transformer, rank: int, alpha: int):
-    """Standard PEFT injection -- MiniMaxH3Transformer3DModel already inherits PeftAdapterMixin
-    and forward() is decorated with @apply_lora_scale, so no custom LoRA plumbing is needed here,
-    unlike Krea2 where target-module resolution had to account for text_fusion.* by hand. Every
-    block is part of the same shared self-attention stack (no modality-isolated layers to exclude
-    the way Krea2's text_fusion.* could be), so the target list is simply every attention and
-    feed-forward linear across all 50 transformer_blocks."""
-    import torch
-    from peft import LoraConfig
+    """Inject the four native H3 targets in each main block.
 
-    # Live run caught a real bug in the previous version of this match: diffusers' FeedForward with
-    # activation_fn="swiglu" (what this transformer uses) wraps its first linear inside a SwiGLU
-    # module ("ff.net.0" is that wrapper, a non-Linear; the actual nn.Linear is "ff.net.0.proj").
-    # Matching bare "ff.net.<digit>" caught the wrapper itself and PEFT rejected it outright ("Target
-    # module SwiGLU(...) is not supported"). Checking isinstance(nn.Linear) directly -- true for
-    # bitsandbytes' Linear8bitLt and Linear4bit too, since both subclass nn.Linear -- avoids this
-    # whole class of "guessed the wrong thing from a name" bug instead of just special-casing swiglu.
-    #
-    # Widened beyond just the main attention/FFN linears (confirmed by inspecting a real ai-toolkit
-    # checkpoint's key list directly, not guessed): also targets each block's adaln_proj.linear (the
-    # AdaLN modulation projection -- named "adaln_proj" in the actual checkpoint, "linear" is
-    # diffusers' name for its inner nn.Linear, per that class's own docstring) and the token_refiner's
-    # own small attention+FFN stack (a separate pre-encoder for the text stream, "No AdaLN and no
-    # rotary embedding" per its own docstring -- reuses the same Attention/FeedForward classes as the
-    # main blocks, so the same to_q/to_k/to_v/to_out.0/ff.net.0.proj/ff.net.2 suffixes apply, just
-    # under token_refiner.refiner_blocks.N instead of transformer_blocks.N).
-    attn_ff_suffixes = (".to_q", ".to_k", ".to_v", ".to_out.0", ".ff.net.0.proj", ".ff.net.2")
-    target_modules = []
-    for name, module in transformer.named_modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
-        in_main_blocks = name.startswith("transformer_blocks.")
-        in_token_refiner = name.startswith("token_refiner.refiner_blocks.")
-        if not (in_main_blocks or in_token_refiner):
-            continue
-        suffixes = attn_ff_suffixes + (".adaln_proj.linear",) if in_main_blocks else attn_ff_suffixes
-        if name.endswith(suffixes):
-            target_modules.append(name)
-    if not target_modules:
-        raise RuntimeError(
-            "No LoRA target modules resolved from transformer_blocks.*/token_refiner.* -- MiniMax-H3's "
-            "module naming may have changed since this script was written against diffusers commit "
-            f"{DIFFUSERS_MINIMAX_H3_COMMIT}."
-        )
-    say(f"Injecting LoRA (rank={rank}, alpha={alpha}) into {len(target_modules)} linear layers "
-        f"(transformer blocks + token refiner + adaln_proj).")
-    lora_config = LoraConfig(r=rank, lora_alpha=alpha, target_modules=target_modules, init_lora_weights="gaussian")
-    transformer.add_adapter(lora_config)
-    return transformer
+    Diffusers splits Q/K/V, but the released H3 model and ComfyUI use one fused
+    qkv_proj.  The custom adapter shares Q/K/V's down projection, preserving the
+    requested rank exactly.  AdaLN and token_refiner are deliberately excluded.
+    """
+    from minimax_h3_lora import inject_native_minimax_h3_lora
+
+    adapter = inject_native_minimax_h3_lora(transformer, rank=rank, alpha=alpha)
+    say(
+        f"Injected native MiniMax-H3 LoRA (rank={rank}, alpha={alpha}) into "
+        f"{len(adapter.records)} modules: qkv_proj/out_proj/mlp.fc1/mlp.fc2 across 50 blocks."
+    )
+    return transformer, adapter
 
 
 # --------------------------------------------------------------------------
 # Training
 # --------------------------------------------------------------------------
-def sample_shifted_sigma(shift: float, batch_size: int, device) -> "torch.Tensor":
-    """Logit-normal base sigma (the SD3/FLUX flow-matching training convention), pushed through
-    MiniMax-H3's own exponential shift -- exactly the formula in MiniMaxH3Scheduler.set_timesteps()
-    (`s*sigma / (1 + (s-1)*sigma)`), reused here rather than re-derived, just applied to a sampled
-    scalar instead of a full inference grid."""
+def sample_shifted_sigma(shift: float, batch_size: int, device, sampling: str = "uniform") -> "torch.Tensor":
+    """Sample a base sigma, then apply MiniMax-H3's exponential shift."""
     import torch
 
-    base = torch.sigmoid(torch.randn(batch_size, device=device))  # logit-normal in (0, 1)
+    if sampling == "uniform":
+        base = torch.rand(batch_size, device=device)
+    elif sampling == "logit_normal":
+        base = torch.sigmoid(torch.randn(batch_size, device=device))
+    else:
+        raise ValueError(f"Unsupported timestep sampling mode: {sampling}")
     return shift * base / (1 + (shift - 1) * base)
 
 
@@ -1214,12 +1149,19 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
                 reference_latents = (reference_latents - latents_mean) / latents_std
 
             full_caption = f"{args.trigger_word}, {caption}" if args.trigger_word and args.trigger_word not in caption else caption
-            text_ids = tokenizer([full_caption], return_tensors="pt", truncation=True).to(device)
+            # Encode the prompt and empty prompt together, then strip padding back off each result.
+            # They intentionally keep their natural token lengths; the training loop builds a
+            # separate packed row layout for the empty-prompt guidance branch.
+            text_ids = tokenizer(
+                [full_caption, ""], return_tensors="pt", truncation=True, padding=True
+            ).to(device)
             text_out = text_encoder.model(
                 input_ids=text_ids["input_ids"], attention_mask=text_ids["attention_mask"],
                 pixel_values=None, output_hidden_states=True,
             )
-            text_embeds = text_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
+            text_hidden = text_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
+            text_embeds = text_hidden[0:1, text_ids["attention_mask"][0].bool()]
+            empty_text_embeds = text_hidden[1:2, text_ids["attention_mask"][1].bool()]
 
             audio_latents = None
             if audio_vae is not None:
@@ -1237,7 +1179,7 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
                     warn(f"{path.name}: no usable audio for this crop window, training video-only for this clip.")
 
             cache.append((
-                video_latents.cpu(), text_embeds.cpu(),
+                video_latents.cpu(), text_embeds.cpu(), empty_text_embeds.cpu(),
                 reference_latents.cpu() if reference_latents is not None else None,
                 audio_latents.cpu() if audio_latents is not None else None,
             ))
@@ -1245,94 +1187,15 @@ def precompute_cache(args, clips, vae, text_encoder, tokenizer, device, resolve_
     return cache
 
 
-def convert_lora_to_comfyui_native(lora_state_dict: dict) -> dict:
-    """Repackage a diffusers-shaped MiniMax-H3 LoRA into the shape ComfyUI's native support actually
-    loads, rather than a shape diffusers' own generic Attention class happens to use.
-
-    Confirmed live: a checkpoint saved with diffusers' key names (transformer_blocks.N.attn.to_q,
-    to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2) produced "lora key not loaded" for every single
-    key in ComfyUI, even after prefixing with "diffusion_model." -- because diffusers' port of
-    MiniMax-H3 restructured the architecture to fit its own reusable Attention/FeedForward classes:
-    it split what the original release (and ComfyUI's from-scratch reimplementation in
-    comfy/ldm/minimax/model.py, read directly, not assumed) keeps as ONE fused qkv_proj Linear per
-    block into three separate to_q/to_k/to_v Linears. ComfyUI's blocks.N.attn.qkv_proj has no
-    separate to_q/to_k/to_v parameter to match against at all, so no amount of renaming alone fixes
-    it -- confirmed by checking Krea 2's native ComfyUI model (comfy/ldm/krea2/model.py), which does
-    keep separate wq/wk/wv and has never hit this, so the split-vs-fused choice is architecture-
-    specific, not a general diffusers quirk.
-
-    Three independent rank-r LoRAs (to_q, to_k, to_v) become one exactly-equivalent rank-3r LoRA for
-    the fused layer: stack the three A matrices vertically, and build a block-diagonal B (zeros
-    everywhere except each B slotted into its own block). For the q-output rows of the fused layer,
-    only B_q's block is nonzero, so B_fused @ A_fused reduces to exactly B_q @ A_q there (and
-    likewise for k/v) -- nothing approximated, no information lost, just repackaged into a shape
-    ComfyUI's fused qkv_proj can actually load. out_proj/mlp.fc1/mlp.fc2 need only the name change,
-    diffusers didn't restructure those, just renamed them (confirmed against comfy/ldm/minimax/
-    model.py's DiTBlock: self.attn.out_proj, self.mlp.fc1, self.mlp.fc2, under self.blocks -- not
-    self.transformer_blocks, that name doesn't exist on ComfyUI's side either).
-
-    token_refiner gets the identical treatment, not just the main blocks -- a real live bug found by
-    reading a ComfyUI log carefully: token_refiner's own attention reuses the SAME Attention class as
-    the main blocks (confirmed against comfy/ldm/minimax/model.py's TokenRefiner: `self.blocks`, a
-    ModuleList of RefinerBlock, each with the same fused `self.attn.qkv_proj` -- not "refiner_blocks",
-    that name doesn't exist on ComfyUI's side either), so its LoRA needs the identical fuse-qkv +
-    rename-out_proj/mlp treatment. This function used to only match "transformer_blocks.N." keys,
-    leaving every token_refiner.refiner_blocks.* key passed through unchanged (still diffusers-shaped,
-    separate to_q/to_k/to_v, wrong prefix) -- ComfyUI's key matcher found no such module at all under
-    either name, so every one of those 12 keys silently failed with "lora key not loaded", the LoRA's
-    effect on the token_refiner text-preprocessing stack was a complete no-op despite training and
-    saving without any error."""
-    import re
-    import torch
-
-    RENAME = {"attn.to_out.0": "attn.out_proj", "ff.net.0.proj": "mlp.fc1", "ff.net.2": "mlp.fc2"}
-    QKV_PARTS = ("attn.to_q", "attn.to_k", "attn.to_v")
-    # (diffusers key-prefix pattern, ComfyUI-native output prefix template) -- checked in order,
-    # first match wins. Both fuse the same way; only the prefix rewrite differs.
-    PREFIX_PATTERNS = (
-        (re.compile(r"transformer_blocks\.(\d+)\.(.+)$"), "blocks.{}"),
-        (re.compile(r"token_refiner\.refiner_blocks\.(\d+)\.(.+)$"), "token_refiner.blocks.{}"),
-    )
-
-    # Keyed by the full ComfyUI-native output prefix (e.g. "blocks.0" vs "token_refiner.blocks.0"),
-    # not a bare block index -- the two namespaces both start counting from 0, so a bare int key
-    # would silently collide the main blocks' and token_refiner's qkv parts together.
-    qkv_parts: dict[str, dict[tuple[str, str], "torch.Tensor"]] = {}
-    out: dict[str, "torch.Tensor"] = {}
-    for key, tensor in lora_state_dict.items():
-        m = None
-        for pattern, out_prefix_template in PREFIX_PATTERNS:
-            m = pattern.match(key)
-            if m:
-                break
-        if not m:
-            out[key] = tensor  # nothing in this trainer's target list should hit this, kept as a safety net
-            continue
-        rest = m.group(2)
-        out_prefix = out_prefix_template.format(m.group(1))
-        matched_qkv = next((p for p in QKV_PARTS if rest.startswith(p)), None)
-        if matched_qkv:
-            suffix = rest[len(matched_qkv):]  # ".lora_A.weight" or ".lora_B.weight"
-            qkv_parts.setdefault(out_prefix, {})[(matched_qkv, suffix)] = tensor
-            continue
-        renamed = rest
-        for old, new in RENAME.items():
-            if rest.startswith(old):
-                renamed = new + rest[len(old):]
-                break
-        out[f"{out_prefix}.{renamed}"] = tensor
-
-    for out_prefix, parts in qkv_parts.items():
-        a_q, a_k, a_v = (parts[(p, ".lora_A.weight")] for p in QKV_PARTS)
-        b_q, b_k, b_v = (parts[(p, ".lora_B.weight")] for p in QKV_PARTS)
-        out[f"{out_prefix}.attn.qkv_proj.lora_A.weight"] = torch.cat([a_q, a_k, a_v], dim=0)
-        out[f"{out_prefix}.attn.qkv_proj.lora_B.weight"] = torch.block_diag(b_q, b_k, b_v)
-    return out
-
-
 def main() -> None:
     setup_environment()
     args = parse_args()
+    if args.guidance_distillation_scale <= 0:
+        raise ValueError("--guidance_distillation_scale must be positive.")
+    if args.base_preservation_loss_weight < 0:
+        raise ValueError("--base_preservation_loss_weight cannot be negative.")
+    if args.lora_alpha <= 0 or args.rank <= 0:
+        raise ValueError("--rank and --lora_alpha must be positive.")
     if args.train_batch_size != 1:
         raise NotImplementedError(
             f"--train_batch_size {args.train_batch_size} is not supported yet -- the training loop "
@@ -1395,10 +1258,38 @@ def main() -> None:
         if args.quant_source in ("comfy_convrot", "comfy_convrot_pruned")
         else load_transformer(args, device)
     )
-    transformer = inject_lora(transformer, args.rank, args.lora_alpha)
+    transformer, lora_adapter = inject_lora(transformer, args.rank, args.lora_alpha)
 
-    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
-    say(f"Trainable LoRA params: {sum(p.numel() for p in trainable_params):,}")
+    if args.resume_lora:
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        resume_path = Path(args.resume_lora)
+        with safe_open(str(resume_path), framework="pt", device="cpu") as resume_file:
+            resume_metadata = resume_file.metadata() or {}
+        resume_mode = resume_metadata.get("ss_h3_training_mode")
+        expected_mode = args.partition.lower()
+        if resume_mode and resume_mode.lower() != expected_mode:
+            raise RuntimeError(
+                f"Cannot resume {args.partition} training from a {resume_mode} LoRA: the partition "
+                "weights are different even though their tensor shapes match."
+            )
+        resume_variant = resume_metadata.get("day0.base_variant")
+        expected_variant = {
+            "bitsandbytes": "base",
+            "comfy_convrot": "convrot",
+            "comfy_convrot_pruned": "convrot_pruned",
+        }[args.quant_source]
+        if resume_variant and resume_variant != expected_variant:
+            warn(
+                f"Resuming a {resume_variant} LoRA on {expected_variant}. Shapes are compatible, "
+                "but the frozen base behavior differs; validate the result in ComfyUI."
+            )
+        lora_adapter.load_native_state_dict(load_file(str(resume_path), device="cpu"))
+        say(f"Resumed native LoRA weights from {resume_path}.")
+
+    trainable_params = list(lora_adapter.parameters())
+    say(f"Trainable LoRA params: {lora_adapter.num_parameters:,}")
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
     # transformers.get_scheduler() rather than a hand-rolled LambdaLR -- "constant" maps to
     # "constant_with_warmup" since this trainer's warmup_steps always applies regardless of which
@@ -1420,9 +1311,13 @@ def main() -> None:
         step_start = time.time()
         if global_step % len(cache) == 0:
             random.shuffle(order)
-        video_latents, text_embeds, reference_latents, audio_latents = cache[order[global_step % len(cache)]]
+        video_latents, text_embeds, empty_text_embeds, reference_latents, audio_latents = cache[
+            order[global_step % len(cache)]
+        ]
         video_latents = video_latents.to(device)
-        text_embeds = text_embeds.to(device, dtype=torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16)
+        text_dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
+        text_embeds = text_embeds.to(device, dtype=text_dtype)
+        empty_text_embeds = empty_text_embeds.to(device, dtype=text_dtype)
         text_token_tags = torch.ones(text_embeds.shape[1], dtype=torch.long)  # 1 = text (no keyframe vision blocks)
 
         batch_size = video_latents.shape[0]
@@ -1450,9 +1345,23 @@ def main() -> None:
             patch_size=patch_size,
             keyframe_anchors=("first",) if has_reference else (),
         )
+        empty_layout = None
+        if args.guidance_distillation_scale != 1.0:
+            empty_text_token_tags = torch.ones(empty_text_embeds.shape[1], dtype=torch.long)
+            empty_layout = build_packed_sequence(
+                text_token_tags=empty_text_token_tags,
+                num_latent_frames=num_latent_frames,
+                latent_height=latent_height,
+                latent_width=latent_width,
+                num_audio_latents=num_audio_latents,
+                patch_size=patch_size,
+                keyframe_anchors=("first",) if has_reference else (),
+            )
 
         noise = torch.randn_like(video_latents)
-        video_sigma = sample_shifted_sigma(args.video_shift, batch_size, device)
+        video_sigma = sample_shifted_sigma(
+            args.video_shift, batch_size, device, sampling=args.timestep_sampling
+        )
         video_t = (1.0 - video_sigma).mean().item()  # one packed layout per batch -> shared scalar timestep
         noisy_video = video_scheduler.scale_noise(video_latents, video_t, noise)
         video_target = video_latents - noise  # data-ward velocity, see scheduling_minimax_h3.py
@@ -1487,7 +1396,9 @@ def main() -> None:
         if has_audio:
             audio_latents = audio_latents.to(device)
             audio_noise = torch.randn_like(audio_latents)
-            audio_sigma = sample_shifted_sigma(args.audio_shift, batch_size, device)
+            audio_sigma = sample_shifted_sigma(
+                args.audio_shift, batch_size, device, sampling=args.timestep_sampling
+            )
             audio_t = (1.0 - audio_sigma).mean().item()
             noisy_audio = video_scheduler.scale_noise(audio_latents, audio_t, audio_noise)
             audio_target = audio_latents - audio_noise  # data-ward velocity, same convention as video
@@ -1501,43 +1412,103 @@ def main() -> None:
             layout, video_timestep=video_t, audio_timestep=audio_t,
             condition_video_timestep=condition_video_t, condition_audio_timestep=audio_t,
         )
+        empty_timesteps = empty_timestep_indices = None
+        if empty_layout is not None:
+            empty_timesteps, empty_timestep_indices = build_row_timesteps(
+                empty_layout, video_timestep=video_t, audio_timestep=audio_t,
+                condition_video_timestep=condition_video_t, condition_audio_timestep=audio_t,
+            )
 
-        output = transformer(
-            hidden_states=noisy_video_rows,
-            audio_hidden_states=noisy_audio_rows,
-            encoder_hidden_states=text_embeds,
-            timestep=timesteps.to(device),
-            timestep_indices=timestep_indices.to(device),
-            token_tags=layout.token_tags.to(device),
-            position_ids=layout.position_ids.to(device),
-            video_indices=layout.video_indices.to(device),
-            audio_indices=layout.audio_indices.to(device),
-            text_indices=layout.text_indices.to(device),
+        model_inputs = {
+            "hidden_states": noisy_video_rows,
+            "audio_hidden_states": noisy_audio_rows,
+            "timestep": timesteps.to(device),
+            "timestep_indices": timestep_indices.to(device),
+            "token_tags": layout.token_tags.to(device),
+            "position_ids": layout.position_ids.to(device),
+            "video_indices": layout.video_indices.to(device),
+            "audio_indices": layout.audio_indices.to(device),
+            "text_indices": layout.text_indices.to(device),
+        }
+
+        empty_model_inputs = None
+        if empty_layout is not None:
+            empty_model_inputs = {
+                "hidden_states": noisy_video_rows,
+                "audio_hidden_states": noisy_audio_rows,
+                "timestep": empty_timesteps.to(device),
+                "timestep_indices": empty_timestep_indices.to(device),
+                "token_tags": empty_layout.token_tags.to(device),
+                "position_ids": empty_layout.position_ids.to(device),
+                "video_indices": empty_layout.video_indices.to(device),
+                "audio_indices": empty_layout.audio_indices.to(device),
+                "text_indices": empty_layout.text_indices.to(device),
+            }
+
+        def predict(encoder_hidden_states, inputs=model_inputs):
+            return transformer(encoder_hidden_states=encoder_hidden_states, **inputs)
+
+        # Run the two frozen branches before the trainable prompted branch. That way their forward
+        # passes do not overlap with the prompted branch's retained backward activations, keeping
+        # the corrected three-forward objective as memory-safe as possible.
+        empty_video_prediction = empty_audio_prediction = None
+        if args.guidance_distillation_scale != 1.0:
+            with torch.no_grad():
+                empty_output = predict(empty_text_embeds, empty_model_inputs)
+                empty_video_prediction = empty_output.sample[:, empty_layout.num_condition_video_rows:].detach()
+                empty_audio_prediction = empty_output.audio_sample.detach() if has_audio else None
+                del empty_output
+
+        base_video_prediction = base_audio_prediction = None
+        if args.base_preservation_loss_weight > 0:
+            with torch.no_grad(), lora_adapter.disabled():
+                base_output = predict(text_embeds)
+                base_video_prediction = base_output.sample[:, layout.num_condition_video_rows:].detach()
+                base_audio_prediction = base_output.audio_sample.detach() if has_audio else None
+                del base_output
+
+        output = predict(text_embeds)
+        prompted_video_prediction = output.sample[:, layout.num_condition_video_rows:]
+
+        from minimax_h3_lora import guidance_consistent_prediction
+
+        guided_video_prediction = guidance_consistent_prediction(
+            prompted_video_prediction,
+            empty_video_prediction if empty_video_prediction is not None else prompted_video_prediction,
+            args.guidance_distillation_scale,
         )
+        loss = torch.nn.functional.mse_loss(guided_video_prediction.float(), target_video_rows.float())
 
-        # Condition-row predictions aren't something we're teaching the model to generate -- they're
-        # the given context -- so they get dropped before computing loss against the real target,
-        # matching layout.num_condition_video_rows exactly (0 when there's no reference, a no-op slice).
-        output_sample = output.sample[:, layout.num_condition_video_rows:]
-        loss = torch.nn.functional.mse_loss(output_sample.float(), target_video_rows.float())
+        preservation_loss_value = None
+        if base_video_prediction is not None:
+            preservation_loss = torch.nn.functional.mse_loss(
+                prompted_video_prediction.float(), base_video_prediction.float()
+            )
+            preservation_loss_value = preservation_loss.item()
+            loss = loss + args.base_preservation_loss_weight * preservation_loss
+
         audio_loss_value = None
         if has_audio:
-            # No slicing needed here (unlike the video sample above) -- num_condition_audio_rows is
-            # always 0, since no audio reference/keyframe conditioning path exists in this trainer,
-            # so every row in output.audio_sample is a real generation target already.
-            audio_loss = torch.nn.functional.mse_loss(output.audio_sample.float(), target_audio_rows.float())
+            # Audio uses the same guidance/base-preservation recipe with its independent sigma.
+            guided_audio_prediction = guidance_consistent_prediction(
+                output.audio_sample,
+                empty_audio_prediction if empty_audio_prediction is not None else output.audio_sample,
+                args.guidance_distillation_scale,
+            )
+            audio_loss = torch.nn.functional.mse_loss(
+                guided_audio_prediction.float(), target_audio_rows.float()
+            )
+            if base_audio_prediction is not None:
+                audio_preservation_loss = torch.nn.functional.mse_loss(
+                    output.audio_sample.float(), base_audio_prediction.float()
+                )
+                audio_loss = audio_loss + args.base_preservation_loss_weight * audio_preservation_loss
             audio_loss_value = audio_loss.item()
             loss = loss + args.audio_loss_weight * audio_loss
 
         loss.backward()
-        # Missing entirely until now -- both other trainers in this codebase clip (train_krea2_lora_
-        # direct.py's own clip_grad_norm_(trainable, 1.0), diffusion-pipe's hardcoded gradient_clipping
-        # = 1.0 for Ideogram4), this one didn't. Particularly risky to skip here specifically: --train_
-        # batch_size is enforced to 1 (no batch-averaging to smooth an outlier clip's gradient), and
-        # adaln_proj.linear is now a LoRA target -- a single AdaLN-zero modulation projection that
-        # directly rescales/shifts an entire block's residual output, so one unclipped gradient spike
-        # on it can push that block into a bad regime for the rest of the run in a way that a normal
-        # attention/FF layer's update wouldn't. Matches the same 1.0 norm the other two trainers use.
+        # Match the 1.0 gradient norm used by the repository's other trainers. Batch size is one,
+        # so clipping remains useful protection against a single outlier clip.
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
         lr_scheduler.step()
@@ -1556,57 +1527,73 @@ def main() -> None:
         }
         if audio_loss_value is not None:
             metrics_row["audio_loss"] = round(audio_loss_value, 6)
+        if preservation_loss_value is not None:
+            metrics_row["preservation_loss"] = round(preservation_loss_value, 6)
         with open(metrics_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(metrics_row) + "\n")
         # Every step for the first 10 (fast feedback on real per-step speed without waiting on a
         # 10-step average), then every 10th after that to keep the log from getting noisy.
         if global_step <= 10 or global_step % 10 == 0:
             audio_suffix = f" audio_loss={audio_loss_value:.4f}" if audio_loss_value is not None else ""
-            say(f"step {global_step}/{args.max_train_steps} loss={loss.item():.4f}{audio_suffix} ({step_seconds:.1f}s/step)")
+            preservation_suffix = (
+                f" preserve={preservation_loss_value:.4f}" if preservation_loss_value is not None else ""
+            )
+            say(
+                f"step {global_step}/{args.max_train_steps} loss={loss.item():.4f}"
+                f"{audio_suffix}{preservation_suffix} ({step_seconds:.1f}s/step)"
+            )
 
         if global_step % args.save_every_n_steps == 0 or global_step == args.max_train_steps:
-            # NOT transformer.save_lora_adapter() -- that method is broken for a quantized model at
-            # this diffusers commit regardless of its upcast_before_saving argument: it always calls
-            # `self.to(dtype=torch.float32 if upcast_before_saving else None)`, and modeling_utils.py's
-            # `to()` checks `dtype_present_in_args = "dtype" in kwargs` -- true whenever the *key*
-            # dtype is present at all, even set to None -- so it hits the "Casting a quantized model
-            # to a new dtype is unsupported" guard unconditionally, upcast requested or not. Live run
-            # confirmed this crashes step 25's checkpoint save after steps 1/10/20 trained correctly.
-            # Replicated the rest of that method's actual logic directly (it's just
-            # get_peft_model_state_dict + safetensors.save_file) instead of waiting on an upstream fix
-            # to an unreleased branch.
-            from peft.utils import get_peft_model_state_dict
             import safetensors.torch
 
             ckpt_dir = checkpoints_dir / f"step-{global_step:06d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            lora_state_dict = get_peft_model_state_dict(transformer, adapter_name="default")
-            # PEFT keeps LoRA A/B in float32 by default whenever the base layer is bitsandbytes-
-            # quantized (our case, --quantize_base 1) -- confirmed live: checkpoints were coming out
-            # ~2x the size a bf16 save would produce, and get_peft_model_state_dict() applies no
-            # casting of its own, it just returns whatever dtype the adapter parameters were created
-            # in. The earlier version of this comment assumed avoiding save_lora_adapter()'s broken
-            # fp32 upcast call meant we already had bf16 -- wrong, that upcast was never the source of
-            # the fp32-ness to begin with. bf16 LoRA weights load in ComfyUI exactly the same as fp32
-            # ones (same as every other diffusion LoRA in the wild); this just halves the file size
-            # for identical trained weights, not a quality tradeoff.
-            save_dtype = torch.bfloat16 if args.base_dtype == "bfloat16" else torch.float16
-            lora_state_dict = {k: v.to(save_dtype) for k, v in lora_state_dict.items()}
-            # get_peft_model_state_dict() returns diffusers-shaped keys (transformer_blocks.N.attn.
-            # to_q/to_k/to_v, separate Linears) -- but ComfyUI's native MiniMax-H3 support targets the
-            # original release's fused-qkv_proj layout instead (see convert_lora_to_comfyui_native()'s
-            # docstring for the live-confirmed why). A prefix rename alone isn't enough here, unlike
-            # the other two trainers -- this one needs the actual per-block QKV repackaging.
-            lora_state_dict = convert_lora_to_comfyui_native(lora_state_dict)
-            # ComfyUI's own top-level convention for every model's DiT weights, confirmed by the
-            # earlier "diffusion_model." prefix already being recognized (just not matched past it).
-            lora_state_dict = {f"diffusion_model.{k}": v for k, v in lora_state_dict.items()}
-            # Filename matches the cross-trainer convention app/main.py's job_checkpoints()/
-            # download_checkpoint() already hardcode (Ideogram4's trainer follows the same
-            # convention for the same reason) -- not because H3 is Krea2, just so the existing
-            # checkpoint-listing/download UI works unmodified for every trainer.
+            save_dtype = {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+            }[args.save_dtype]
+            lora_state_dict = lora_adapter.native_state_dict(dtype=save_dtype)
+            if len(lora_state_dict) != 600:
+                raise RuntimeError(
+                    f"Native H3 checkpoint must contain exactly 600 tensors, got {len(lora_state_dict)}."
+                )
+            metadata = {
+                "format": "pt",
+                "modelspec.architecture": "MiniMax-H3/lora",
+                "modelspec.title": f"{args.run_name} MiniMax-H3 LoRA",
+                "modelspec.description": "Day0 native-rank MiniMax-H3 LoRA",
+                "ss_base_model_version": str(args.pretrained_model_name_or_path),
+                "ss_h3_training_mode": args.partition.lower(),
+                "ss_h3_video_shift": str(args.video_shift),
+                "ss_h3_audio_shift": str(args.audio_shift),
+                "ss_h3_audio_loss_weight": str(args.audio_loss_weight),
+                "ss_network_dim": str(args.rank),
+                "ss_network_alpha": str(args.lora_alpha),
+                "ss_learning_rate": str(args.learning_rate),
+                "ss_lr_scheduler": args.lr_scheduler,
+                "ss_lr_warmup_steps": str(args.lr_warmup_steps),
+                "ss_optimizer": "AdamW",
+                "ss_timestep_sampling": args.timestep_sampling,
+                "ss_guidance_distillation_scale": str(args.guidance_distillation_scale),
+                "ss_guidance_distillation_normalized": "True",
+                "ss_base_model_preservation_loss": str(args.base_preservation_loss_weight),
+                "ss_steps": str(global_step),
+                "ss_training_finished_at": str(int(time.time())),
+                "day0.partition": args.partition,
+                "day0.base_variant": {
+                    "bitsandbytes": "base",
+                    "comfy_convrot": "convrot",
+                    "comfy_convrot_pruned": "convrot_pruned",
+                }[args.quant_source],
+                "day0.quant_source": args.quant_source,
+                "day0.save_dtype": args.save_dtype,
+                "day0.target_modules": "qkv_proj,out_proj,mlp.fc1,mlp.fc2",
+            }
             safetensors.torch.save_file(
-                lora_state_dict, str(ckpt_dir / "krea2_comfy_native_lora.safetensors"), metadata={"format": "pt"}
+                lora_state_dict,
+                str(ckpt_dir / "minimax_h3_lora.safetensors"),
+                metadata=metadata,
             )
             say(f"Saved checkpoint: {ckpt_dir}")
 
