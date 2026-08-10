@@ -6,6 +6,23 @@ adapter therefore learns three unrelated down projections and can only be
 exported as an inflated rank-3r fused adapter.  This module keeps one shared
 down projection for Q/K/V from the beginning, so the learned adapter has the
 same topology and rank as the native MiniMax-H3 checkpoint.
+
+AdaLN (`adaln_proj.linear`, one per block) is targeted only when `include_adaln`
+is set. Real implementations disagree on this by default -- ostris/ai-toolkit's
+generic block-name sweep includes it (no minimax_h3-specific exclusion exists in
+its own source), and a from-scratch measurement in a separate MiniMax-H3 trainer
+("Fizgig", github.com/shootthesound/Fizgig) found the *pruned* checkpoint's AdaLN
+specifically carries ~45% of all weight movement in a matched training epoch,
+while DiffSynth-Studio's and another independent MiniMax-H3 fine-tuning project's
+own default target lists both exclude it. The pruned checkpoint's AdaLN is a
+genuinely different, much smaller layer (8-dim input via a lookup-table curve
+instead of the full model's 2688-dim TimestepEmbedding-MLP conditioning, see
+train_minimax_h3.py's own MINIMAX_H3_CONVROT_PRUNED_FILES comment) -- that's
+the specific case Fizgig measured, so `include_adaln` is meant to be driven by
+whether the pruned checkpoint is in use, not switched on unconditionally. Only
+the per-block AdaLN is ever targeted, never `final_layer.adaln_proj` -- Fizgig's
+own note found that one contributing net noise rather than capability, and it's
+architecturally a different (2x vs 6x-modality) projection regardless.
 """
 
 from __future__ import annotations
@@ -19,6 +36,7 @@ from torch import nn
 
 
 NATIVE_TARGETS_PER_BLOCK = 4
+NATIVE_TARGETS_PER_BLOCK_WITH_ADALN = 5
 EXPECTED_TRANSFORMER_BLOCKS = 50
 
 
@@ -96,13 +114,14 @@ class NativeLoRARecord:
 class MiniMaxH3NativeLoRA:
     """Owns the injected wrappers and exports the exact native H3 LoRA layout."""
 
-    def __init__(self, rank: int, alpha: float) -> None:
+    def __init__(self, rank: int, alpha: float, include_adaln: bool = False) -> None:
         if rank <= 0:
             raise ValueError("LoRA rank must be positive.")
         if alpha <= 0:
             raise ValueError("LoRA alpha must be positive.")
         self.rank = int(rank)
         self.alpha = float(alpha)
+        self.include_adaln = bool(include_adaln)
         self.records: list[NativeLoRARecord] = []
         self.wrappers: list[NativeLoRALinear] = []
 
@@ -152,11 +171,14 @@ class MiniMaxH3NativeLoRA:
                 )
             )
 
-            for diffusers_path, native_path in (
+            per_block_targets = [
                 ("attn.to_out.0", "attn.out_proj"),
                 ("ff.net.0.proj", "mlp.fc1"),
                 ("ff.net.2", "mlp.fc2"),
-            ):
+            ]
+            if self.include_adaln:
+                per_block_targets.append(("adaln_proj.linear", "adaln_proj.linear"))
+            for diffusers_path, native_path in per_block_targets:
                 holder, attr = _resolve(block, diffusers_path)
                 down = self._new_down(getattr(holder, attr))
                 wrapped = self._wrap(holder, attr, down)
@@ -168,7 +190,8 @@ class MiniMaxH3NativeLoRA:
                     )
                 )
 
-        expected = EXPECTED_TRANSFORMER_BLOCKS * NATIVE_TARGETS_PER_BLOCK
+        per_block = NATIVE_TARGETS_PER_BLOCK_WITH_ADALN if self.include_adaln else NATIVE_TARGETS_PER_BLOCK
+        expected = EXPECTED_TRANSFORMER_BLOCKS * per_block
         if len(self.records) != expected:
             raise RuntimeError(f"Expected {expected} native H3 LoRA modules, created {len(self.records)}.")
         return self
@@ -244,9 +267,9 @@ class MiniMaxH3NativeLoRA:
 
 
 def inject_native_minimax_h3_lora(
-    transformer: nn.Module, rank: int, alpha: float
+    transformer: nn.Module, rank: int, alpha: float, include_adaln: bool = False
 ) -> MiniMaxH3NativeLoRA:
-    return MiniMaxH3NativeLoRA(rank=rank, alpha=alpha).inject(transformer)
+    return MiniMaxH3NativeLoRA(rank=rank, alpha=alpha, include_adaln=include_adaln).inject(transformer)
 
 
 def guidance_consistent_prediction(

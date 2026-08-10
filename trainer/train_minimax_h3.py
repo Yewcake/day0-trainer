@@ -99,6 +99,13 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 WORKDIR = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 DIFFUSERS_MINIMAX_H3_COMMIT = "abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc"  # huggingface/diffusers, branch minimax-h3
 MINIMAX_H3_MODEL_ID = "MiniMaxAI/MiniMax-H3"
+DAY0_TRAINER_METADATA = {
+    "modelspec.author": "Yewcake",
+    "modelspec.implementation": "https://github.com/Yewcake/day0-trainer",
+    "ss_training_comment": "Made by Yewcake Day0 Trainer",
+    "day0.trainer": "Yewcake Day0 Trainer",
+    "day0.trainer_url": "https://github.com/Yewcake/day0-trainer",
+}
 
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_FRAMES_PER_CHUNK = 17
@@ -149,10 +156,19 @@ def run(cmd: list[str], **kwargs) -> None:
     subprocess.run(cmd, check=True, **kwargs)
 
 
-def align_num_frames(num_frames: int) -> int:
-    """Round up to the nearest valid `17*n + 5` clip length -- diffusers' own packing.align_num_frames."""
+def align_num_frames_down(num_frames: int) -> int:
+    """Round down to the nearest valid `17*n + 5` clip length, floor 5. diffusers' own generic
+    packing.align_num_frames rounds UP -- appropriate for inference, where under-shooting a
+    requested duration is the wrong failure mode. ai-toolkit's real MiniMax-H3 integration
+    deliberately overrides with its own align_num_frames_down for training specifically (its
+    get_frame_count_snapper() hook returns the down-rounding variant, not the generic one), and
+    Inline Studio's independent implementation does the same (trims the tail, never pads).
+    Rounding up for training requires padding short clips with a repeated last frame to reach
+    the target length -- teaching the model on synthetic frozen-frame content it never actually
+    saw. Rounding down never needs to pad: the aligned length is always <= what's available."""
+    num_frames = max(num_frames, MINIMAX_H3_LATENTS_PER_CHUNK)
     while num_frames % MINIMAX_H3_FRAMES_PER_CHUNK != MINIMAX_H3_LATENTS_PER_CHUNK:
-        num_frames += 1
+        num_frames -= 1
     return num_frames
 
 
@@ -231,7 +247,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio_loss_weight", type=float, default=1.0)  # matches ss_h3_audio_loss_weight: 1 convention
     parser.add_argument("--guidance_distillation_scale", type=float, default=3.0)
     parser.add_argument("--base_preservation_loss_weight", type=float, default=0.05)
-    parser.add_argument("--timestep_sampling", default="uniform", choices=["uniform", "logit_normal"])
+    # logit_normal (SD3/FLUX flow-matching convention, also this trainer's own sample_shifted_sigma()
+    # docstring) is the default -- it concentrates sampling around the mid-range noise levels where
+    # fine detail is actually resolved. "uniform" spreads training evenly across every noise level
+    # instead, starving that mid-range; this was the trainer's own prior default and is the leading
+    # suspect for the fine, regular grid/crosshatch artifact seen on a real run using it. Kept as a
+    # choice (not removed) since it's the correct option for a deliberate coverage experiment, just
+    # not the right default.
+    parser.add_argument("--timestep_sampling", default="logit_normal", choices=["uniform", "logit_normal"])
     parser.add_argument("--save_dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--resume_lora", default="")
     parser.add_argument("--base_dtype", default="bfloat16", choices=["bfloat16", "float16"])
@@ -311,14 +334,19 @@ def load_and_prepare_clip(path, num_frames: int, resolve_canvas_size):
         indices = indices.long().clamp(max=video.shape[0] - 1)
         video = video[indices]
 
-    aligned = align_num_frames(min(num_frames, video.shape[0]) or MINIMAX_H3_LATENTS_PER_CHUNK)
+    # Rounds DOWN and never pads (see align_num_frames_down's own docstring for why) -- aligned is
+    # therefore always <= video.shape[0], except the degenerate case of a source clip shorter than
+    # MiniMax-H3's minimum 5-frame grid point, which is a bad source file, not something to paper
+    # over with synthetic repeated frames.
+    aligned = align_num_frames_down(min(num_frames, video.shape[0]))
     if video.shape[0] < aligned:
-        pad = video[-1:].repeat(aligned - video.shape[0], 1, 1, 1)
-        video = torch.cat([video, pad], dim=0)
-        start = 0
-    else:
-        start = random.randint(0, video.shape[0] - aligned)
-        video = video[start:start + aligned]
+        raise RuntimeError(
+            f"{path.name}: only {video.shape[0]} frames after 24fps resampling, shorter than "
+            f"MiniMax-H3's minimum clip length ({aligned} frames). Remove this clip from the "
+            "dataset or replace it with a longer source."
+        )
+    start = random.randint(0, video.shape[0] - aligned)
+    video = video[start:start + aligned]
     # Both start and aligned are frame counts on the already-24fps-resampled timeline above, so
     # dividing by MINIMAX_H3_FPS gives seconds regardless of the source file's own frame rate.
     clip_start_seconds = start / MINIMAX_H3_FPS
@@ -1053,19 +1081,24 @@ def load_transformer_convrot(args, device):
     return transformer
 
 
-def inject_lora(transformer, rank: int, alpha: int):
-    """Inject the four native H3 targets in each main block.
+def inject_lora(transformer, rank: int, alpha: int, include_adaln: bool):
+    """Inject the native H3 targets (four per block, five when include_adaln) in each main block.
 
     Diffusers splits Q/K/V, but the released H3 model and ComfyUI use one fused
     qkv_proj.  The custom adapter shares Q/K/V's down projection, preserving the
-    requested rank exactly.  AdaLN and token_refiner are deliberately excluded.
+    requested rank exactly.  token_refiner is always excluded (a small text
+    pre-encoder, no AdaLN/RoPE of its own -- not where identity/motion lives).
+    AdaLN is included only when include_adaln is set -- see minimax_h3_lora.py's
+    module docstring for why this is tied to the pruned checkpoint specifically,
+    not switched on unconditionally.
     """
     from minimax_h3_lora import inject_native_minimax_h3_lora
 
-    adapter = inject_native_minimax_h3_lora(transformer, rank=rank, alpha=alpha)
+    adapter = inject_native_minimax_h3_lora(transformer, rank=rank, alpha=alpha, include_adaln=include_adaln)
+    targets_desc = "qkv_proj/out_proj/mlp.fc1/mlp.fc2" + ("/adaln_proj" if include_adaln else "")
     say(
-        f"Injected native MiniMax-H3 LoRA (rank={rank}, alpha={alpha}) into "
-        f"{len(adapter.records)} modules: qkv_proj/out_proj/mlp.fc1/mlp.fc2 across 50 blocks."
+        f"Injected native MiniMax-H3 LoRA (rank={rank}, alpha={alpha}, include_adaln={include_adaln}) "
+        f"into {len(adapter.records)} modules: {targets_desc} across 50 blocks."
     )
     return transformer, adapter
 
@@ -1258,7 +1291,13 @@ def main() -> None:
         if args.quant_source in ("comfy_convrot", "comfy_convrot_pruned")
         else load_transformer(args, device)
     )
-    transformer, lora_adapter = inject_lora(transformer, args.rank, args.lora_alpha)
+    # Include AdaLN only for the pruned checkpoint -- see minimax_h3_lora.py's module docstring:
+    # a real measurement (Fizgig) found the pruned checkpoint's 8-dim AdaLN carries ~45% of all
+    # weight movement in a matched training epoch, while the non-pruned checkpoint's much larger
+    # 2688-dim AdaLN doesn't carry that same disproportionate share, and most surveyed
+    # implementations exclude it there.
+    include_adaln = args.quant_source == "comfy_convrot_pruned"
+    transformer, lora_adapter = inject_lora(transformer, args.rank, args.lora_alpha, include_adaln)
 
     if args.resume_lora:
         from safetensors import safe_open
@@ -1554,15 +1593,19 @@ def main() -> None:
                 "float16": torch.float16,
             }[args.save_dtype]
             lora_state_dict = lora_adapter.native_state_dict(dtype=save_dtype)
-            if len(lora_state_dict) != 600:
+            # 3 tensors (down/up/alpha) per module; 4 modules/block without AdaLN, 5 with.
+            expected_tensors = len(lora_adapter.records) * 3
+            if len(lora_state_dict) != expected_tensors:
                 raise RuntimeError(
-                    f"Native H3 checkpoint must contain exactly 600 tensors, got {len(lora_state_dict)}."
+                    f"Native H3 checkpoint must contain exactly {expected_tensors} tensors "
+                    f"({len(lora_adapter.records)} modules x 3), got {len(lora_state_dict)}."
                 )
             metadata = {
+                **DAY0_TRAINER_METADATA,
                 "format": "pt",
                 "modelspec.architecture": "MiniMax-H3/lora",
                 "modelspec.title": f"{args.run_name} MiniMax-H3 LoRA",
-                "modelspec.description": "Day0 native-rank MiniMax-H3 LoRA",
+                "modelspec.description": "MiniMax-H3 native-rank LoRA made by Yewcake Day0 Trainer",
                 "ss_base_model_version": str(args.pretrained_model_name_or_path),
                 "ss_h3_training_mode": args.partition.lower(),
                 "ss_h3_video_shift": str(args.video_shift),

@@ -15,7 +15,7 @@ from minimax_h3_lora import (  # noqa: E402
     guidance_consistent_prediction,
     inject_native_minimax_h3_lora,
 )
-from train_minimax_h3 import sample_shifted_sigma  # noqa: E402
+from train_minimax_h3 import DAY0_TRAINER_METADATA, sample_shifted_sigma  # noqa: E402
 
 
 class FakeSwiGLU(nn.Module):
@@ -62,6 +62,18 @@ class FakeTransformer(nn.Module):
 
 
 class MiniMaxH3NativeLoRATests(unittest.TestCase):
+    def test_yewcake_day0_creator_metadata(self) -> None:
+        self.assertEqual(DAY0_TRAINER_METADATA["modelspec.author"], "Yewcake")
+        self.assertEqual(
+            DAY0_TRAINER_METADATA["ss_training_comment"],
+            "Made by Yewcake Day0 Trainer",
+        )
+        self.assertEqual(DAY0_TRAINER_METADATA["day0.trainer"], "Yewcake Day0 Trainer")
+        self.assertEqual(
+            DAY0_TRAINER_METADATA["modelspec.implementation"],
+            "https://github.com/Yewcake/day0-trainer",
+        )
+
     def test_exact_target_and_export_contract(self) -> None:
         transformer = FakeTransformer()
         adaln_before = transformer.transformer_blocks[0].adaln_proj.linear
@@ -83,6 +95,32 @@ class MiniMaxH3NativeLoRATests(unittest.TestCase):
         self.assertIn("lora_unet_blocks_0_attn_qkv_proj.lora_down.weight", state)
         self.assertIn("lora_unet_blocks_49_mlp_fc2.alpha", state)
         self.assertTrue(all(not torch.count_nonzero(record.ups[0].weight) for record in adapter.records))
+
+    def test_include_adaln_target(self) -> None:
+        transformer = FakeTransformer()
+        refiner_q_before = transformer.token_refiner.refiner_blocks[0].attn.to_q
+
+        adapter = inject_native_minimax_h3_lora(transformer, rank=2, alpha=1, include_adaln=True)
+
+        # 5 modules/block (qkv_proj, out_proj, fc1, fc2, adaln_proj) x 50 blocks.
+        self.assertEqual(len(adapter.records), 250)
+        # token_refiner is never a target, adaln or not.
+        self.assertIs(transformer.token_refiner.refiner_blocks[0].attn.to_q, refiner_q_before)
+
+        block = transformer.transformer_blocks[0]
+        self.assertIsInstance(block.adaln_proj.linear, type(block.attn.to_out[0]))  # wrapped, same class
+        # AdaLN's down projection must NOT be shared with qkv's -- it's a separate, unrelated input.
+        self.assertIsNot(block.adaln_proj.linear.lora_down, block.attn.to_q.lora_down)
+
+        state = adapter.native_state_dict(dtype=torch.float32)
+        self.assertEqual(len(state), 750)
+        self.assertIn("lora_unet_blocks_0_adaln_proj_linear.lora_down.weight", state)
+        self.assertIn("lora_unet_blocks_49_adaln_proj_linear.alpha", state)
+        self.assertFalse(any("token_refiner" in key for key in state))
+        # AdaLN's own down projection shape must match ITS in_features (3 in this fake, deliberately
+        # different from the block width 4), not silently reuse qkv's -- this is what would break if
+        # a real pruned checkpoint's 8-dim AdaLN got wired to a differently-sized shared projection.
+        self.assertEqual(tuple(block.adaln_proj.linear.lora_down.weight.shape), (2, 3))
 
     def test_shared_qkv_matches_one_native_fused_adapter(self) -> None:
         torch.manual_seed(7)

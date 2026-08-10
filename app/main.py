@@ -30,6 +30,11 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 from . import enhance
+from .caption_prompts import (
+    DEFAULT_VIDEO_CAPTION_INSTRUCTION,
+    SMART_CLIP_INSTRUCTION_TEMPLATE,
+    caption_variation_context,
+)
 from PIL import Image
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -755,20 +760,20 @@ def autoclip_videos(name: str, payload: dict) -> dict:
 # --------------------------------------------------------------------------
 _smart_clip_runs: dict[str, dict] = {}
 
-SMART_CLIP_INSTRUCTION_TEMPLATE = (
-    "You are curating a video LoRA training dataset. Watch this clip and identify up to 3 short "
-    "segments where clear physical motion/action happens (not static shots, pans, or dead time). "
-    "Each segment should be a single continuous moment, roughly {clip_seconds} seconds long, that "
-    "on its own teaches the motion well. For each segment also write a dataset caption for it -- but "
-    "the model must learn the motion itself as an implicit concept, not tied to text, so the caption "
-    "must describe everything EXCEPT the motion: expression, outfit, pose or starting body position, "
-    "hairstyle, camera angle, jewelry, accessories, setting, background, in concise natural positive "
-    "phrasing, with no verbs of motion or action and no mention of what physically happens or "
-    "changes. Respond with ONLY a JSON array, no markdown fences, no other text, in this exact shape: "
-    "[{{\"start\": <seconds float>, \"end\": <seconds float>, \"caption\": \"<text>\"}}, ...]. If "
-    "there isn't enough distinct motion for multiple segments, return fewer entries. Times must fall "
-    "within the clip's actual duration."
-)
+
+def _existing_caption_history(items: list[Path]) -> list[str]:
+    history: list[str] = []
+    for item in items:
+        caption_path = item.with_suffix(".txt")
+        if not caption_path.exists():
+            continue
+        try:
+            caption = caption_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if caption:
+            history.append(caption)
+    return history
 
 
 def _parse_gemini_json_array(text: str) -> list:
@@ -803,6 +808,7 @@ def _smart_clip_worker(name: str, videos: list[Path], clip_seconds: float, model
     state = _smart_clip_runs[name]
     target = dataset_dir(name)
     ffmpeg = shutil.which("ffmpeg")
+    previous_captions = _existing_caption_history(dataset_videos(target))
     state.update({"total": len(videos), "done": 0, "errors": [], "clips_created": 0, "status": "running"})
     for source in videos:
         if state.get("cancel"):
@@ -811,7 +817,10 @@ def _smart_clip_worker(name: str, videos: list[Path], clip_seconds: float, model
         try:
             duration = _probe_video(source)["duration"]
             parts = [
-                {"text": SMART_CLIP_INSTRUCTION_TEMPLATE.format(clip_seconds=clip_seconds)},
+                {"text": SMART_CLIP_INSTRUCTION_TEMPLATE.format(
+                    clip_seconds=clip_seconds,
+                    variation_context=caption_variation_context(previous_captions),
+                )},
                 encode_video_for_gemini(source),
             ]
             raw = gemini_generate(model, parts, key, timeout=120)
@@ -842,6 +851,11 @@ def _smart_clip_worker(name: str, videos: list[Path], clip_seconds: float, model
                     dest = target / f"{stem}_part{i}{source.suffix}"
                     shutil.move(str(tmp_path), dest)
                     _write_smart_caption(dest, valid[i - 1].get("caption", ""), trigger)
+                previous_captions.extend(
+                    str(segment.get("caption", "")).strip()
+                    for segment in valid
+                    if str(segment.get("caption", "")).strip()
+                )
             finally:
                 for tmp_path in tmp_paths:
                     tmp_path.unlink(missing_ok=True)  # no-op for any already moved into place
@@ -1160,25 +1174,6 @@ DEFAULT_CAPTION_INSTRUCTION = (
     "but 'no visible jewelry' is not allowed -- just don't mention things that aren't there."
 )
 
-# Deliberately the opposite of the image instruction's completeness: the whole point of a video
-# LoRA dataset is for the model to learn the motion itself as an implicit concept, not one tied to
-# a text description, so the caption must describe everything EXCEPT what's moving or changing.
-# Captioning the motion here would teach the model to only reproduce that motion when the exact
-# caption text is present, rather than baking it in as the dataset's constant, unlabeled trait.
-DEFAULT_VIDEO_CAPTION_INSTRUCTION = (
-    "You are a world-class AI model specialist for video generation LoRA datasets. This is a short "
-    "video clip. The model must learn the motion/action happening in it as an implicit concept, not "
-    "tied to any text description, so caption everything EXCEPT the motion. Mention only the static, "
-    "held-constant elements visible throughout the clip: expression, outfit, pose or starting body "
-    "position, hairstyle, camera angle, whether there is blur, jewelry, accessories, setting, "
-    "background. Do not mention face shape or body type. Do NOT describe what physically happens, "
-    "moves, or changes over the clip -- no verbs of motion or action at all. Caption in concise but "
-    "detailed natural language. Output only the caption, no preamble. If a tattoo is visible, caption "
-    "it. Caption only what you see, in natural positive phrasing only -- do not use words like 'no', "
-    "'or', 'not'."
-)
-
-
 def wrap_ideogram4_caption(text: str, trigger: str) -> dict:
     """Ports the caption JSON shape diffusion-pipe's Ideogram4 config expects (see
     IDEOGRAM/Train_Ideogram4_DiffusionPipe_FIXED.sh's wrap_plain_caption). Built
@@ -1208,7 +1203,9 @@ def _caption_worker(
 ) -> None:
     state = _caption_runs[name]
     target = dataset_dir(name)
-    items = dataset_videos(target) if method == "video" else dataset_images(target)
+    all_items = dataset_videos(target) if method == "video" else dataset_images(target)
+    previous_captions = _existing_caption_history(all_items) if method == "video" else []
+    items = all_items
     if only_missing:
         items = [item for item in items if not item.with_suffix(".txt").exists()]
     state.update({"total": len(items), "done": 0, "errors": [], "status": "running"})
@@ -1218,10 +1215,14 @@ def _caption_worker(
             return
         try:
             if method == "video":
-                parts = [{"text": instruction}, encode_video_for_gemini(item)]
+                clip_instruction = instruction + caption_variation_context(previous_captions)
+                parts = [{"text": clip_instruction}, encode_video_for_gemini(item)]
             else:
                 parts = [{"text": instruction}, encode_image_for_gemini(item)]
-            caption = gemini_generate(model, parts, key).replace("\n", " ").strip()
+            generated_caption = gemini_generate(model, parts, key).replace("\n", " ").strip()
+            if method == "video" and generated_caption:
+                previous_captions.append(generated_caption)
+            caption = generated_caption
             if trigger and trigger not in caption:
                 caption = f"{trigger}, {caption}"
             if caption_format == "ideogram4_json":
@@ -1345,7 +1346,7 @@ def create_job(payload: dict) -> dict:
         "partition": "FL2VA", "quant_source": "bitsandbytes", "num_frames": 73, "short_edge": 768,
         "train_audio": False, "audio_loss_weight": 1.0,
         "lora_alpha": 32, "guidance_distillation_scale": 3.0,
-        "base_preservation_loss_weight": 0.05, "timestep_sampling": "uniform",
+        "base_preservation_loss_weight": 0.05, "timestep_sampling": "logit_normal",
         "save_dtype": "bfloat16",
         "lr_scheduler": "cosine",
         "seed": 42,
