@@ -736,7 +736,7 @@ async function openDataset(name){
       <div class="row"><label>Trigger word</label><input id="cap_trigger" placeholder="prefixed to every caption (optional)"></div>
       <div class="row"><label>Caption method</label><select id="cap_method" onchange="onCapMethodChange('${name}')">
         <option value="image" ${method==='image'?'selected':''}>Image</option>
-        <option value="video" ${method==='video'?'selected':''}>Video (excludes motion from caption)</option></select></div>
+        <option value="video" ${method==='video'?'selected':''}>Video (describes action and motion)</option></select></div>
       <div class="row" style="align-items:start"><label style="padding-top:8px">Instruction</label>
         <textarea id="cap_instruction" style="min-height:110px">${def.instruction}</textarea></div>
       <div class="row"><label>Scope</label><select id="cap_scope">
@@ -754,6 +754,7 @@ async function openDataset(name){
       <span class="hint" id="selCount">0 selected</span>
       <div class="spacer"></div>
       <button type="button" onclick="enhanceSelected('${name}')">✦ Enhance selected</button>
+      <button type="button" onclick="adjustSelected('${name}')">🎨 Adjust selected</button>
       <input id="autoclipSeconds" type="number" min="0.5" step="0.5" value="3" style="max-width:64px" title="Clip length in seconds">
       <button type="button" onclick="autoclipVideos('${name}')">✂ Autoclip videos</button>
       <button type="button" onclick="autoclipSmart('${name}')">🪄 Smart autoclip</button>
@@ -775,6 +776,40 @@ async function openDataset(name){
         </select></div>
       <div id="enhanceStaging"></div>
       <div id="enhanceRows"></div>
+    </div>
+    <div class="enh-panel" id="adjustPanel">
+      <div class="modal-title" style="margin-bottom:8px">Adjust dataset</div>
+      <div id="adjustStaging" class="hint" style="margin-bottom:8px;display:block"></div>
+      <div class="row"><label>Trim uniform borders</label>
+        <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="adj_trim" style="width:auto">Auto-crop solid-color letterboxing/frames (tolerance <input id="adj_trim_tol" type="number" value="10" min="1" max="60" style="max-width:60px;display:inline-block">)</label></div>
+      <div class="row"><label>Crop to aspect</label><select id="adj_aspect">
+        <option value="">Off</option>
+        <option value="1,1">1:1 square</option>
+        <option value="4,5">4:5 portrait</option>
+        <option value="3,4">3:4 portrait</option>
+        <option value="9,16">9:16 portrait</option>
+        <option value="16,9">16:9 landscape</option>
+      </select></div>
+      <div class="row"><label>Cube LUT (.cube)</label>
+        <div><input type="file" id="adj_lut_file" accept=".cube" onchange="onAdjustLutFile(event)">
+        <div class="hint" id="adj_lut_name">No LUT loaded</div>
+        <input id="adj_lut_strength" type="range" min="0" max="1" step="0.05" value="1"> <span id="adj_lut_strength_val" class="hint">1.00</span></div></div>
+      <div class="row"><label>White balance</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="hint">Temp</span><input id="adj_temp" type="range" min="2000" max="12000" step="100" value="6500">
+          <span class="hint">Tint</span><input id="adj_tint" type="range" min="-100" max="100" step="1" value="0"></div></div>
+      <div class="row"><label>Contrast</label><input id="adj_contrast" type="range" min="0.5" max="1.8" step="0.02" value="1"></div>
+      <div class="row"><label>Saturation</label><input id="adj_saturation" type="range" min="0" max="2" step="0.02" value="1"></div>
+      <div class="row"><label>Vignette</label><input id="adj_vignette" type="range" min="-1" max="1" step="0.02" value="0"></div>
+      <div class="row"><label>Color match</label>
+        <div><select id="adj_match_ref"><option value="">Off (no reference)</option></select>
+        <input id="adj_match_strength" type="range" min="0" max="1" step="0.05" value="1" title="Match strength"></div></div>
+      <div class="modal-actions" style="justify-content:flex-start;margin-top:10px">
+        <button type="button" onclick="previewAdjust('${name}')">Preview on first image</button>
+        <button type="button" class="primary" onclick="applyAdjust('${name}')">Apply to selected</button>
+        <button type="button" onclick="revertAdjust('${name}')">Revert last apply</button>
+        <button type="button" onclick="cancelAdjustStaging()">Close</button></div>
+      <div id="adjustPreview" style="margin-top:10px"></div>
     </div>
     <div class="dsgrid" id="dsgrid"></div>`;
   loadGeminiModels(true);
@@ -1090,6 +1125,97 @@ function renderEnhanceStaging(name){
       <button type="button" class="primary" onclick="confirmEnhanceGenerate('${name}')">Generate</button>
       <button type="button" onclick="cancelEnhanceStaging()">Cancel</button>
     </div>`;
+}
+
+/* ---------------- dataset adjustment pipeline (LUT/curves/crop/color-match) ---------------- */
+let _adjustLutContent = null;
+let _adjustStagedImages = [];
+
+function onAdjustLutFile(ev){
+  const file = ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => { _adjustLutContent = reader.result; $('#adj_lut_name').textContent = file.name; };
+  reader.readAsText(file);
+}
+
+function buildAdjustmentsPayload(){
+  // White balance/contrast/saturation/vignette are always sent -- the backend's own
+  // handlers already no-op at their default values (6500K/0 tint, 1.0, 1.0, 0.0), so
+  // there's no need to duplicate that "is this a no-op" logic here too.
+  const adjustments = {
+    white_balance: {temperature: +$('#adj_temp').value, tint: +$('#adj_tint').value},
+    contrast: {contrast: +$('#adj_contrast').value},
+    hue_saturation: {hue_shift: 0, saturation: +$('#adj_saturation').value},
+    vignette: {amount: +$('#adj_vignette').value},
+  };
+  if ($('#adj_trim').checked) adjustments.trim_borders = {tolerance: +$('#adj_trim_tol').value};
+  const aspect = $('#adj_aspect').value;
+  if (aspect){
+    const [rw, rh] = aspect.split(',').map(Number);
+    adjustments.crop_aspect = {ratio: [rw, rh]};
+  }
+  if (_adjustLutContent) adjustments.cube_lut = {cube_lut: _adjustLutContent, cube_lut_strength: +$('#adj_lut_strength').value};
+  const matchRef = $('#adj_match_ref')?.value;
+  if (matchRef) adjustments.color_match = {reference_image: matchRef, strength: +$('#adj_match_strength').value, method: 'cdf'};
+  return adjustments;
+}
+
+async function adjustSelected(name){
+  const images = [...document.querySelectorAll('#dsgrid .selchk:checked')].map(el=>el.dataset.image);
+  if (!images.length){ toast('Select at least one image first.'); return; }
+  _adjustStagedImages = images;
+  const staging = $('#adjustStaging');
+  if (staging) staging.textContent = `Adjusting: ${images.join(', ')}`;
+  const refSelect = $('#adj_match_ref');
+  if (refSelect){
+    refSelect.innerHTML = '<option value="">Off (no reference)</option>' +
+      _dsItemsCache.filter(it => !it.is_video).map(it => `<option value="${escHtml(it.image)}">${escHtml(it.image)}</option>`).join('');
+  }
+  const panel = $('#adjustPanel');
+  if (panel){ panel.style.display = 'block'; panel.scrollIntoView({behavior:'smooth', block:'nearest'}); }
+}
+
+function cancelAdjustStaging(){
+  _adjustStagedImages = [];
+  const panel = $('#adjustPanel');
+  if (panel) panel.style.display = 'none';
+  const preview = $('#adjustPreview');
+  if (preview) preview.innerHTML = '';
+}
+
+async function previewAdjust(name){
+  if (!_adjustStagedImages.length){ toast('Select at least one image first.'); return; }
+  const image = _adjustStagedImages[0];
+  try{
+    const res = await post(`/api/datasets/${encodeURIComponent(name)}/adjust/preview`, {image, adjustments: buildAdjustmentsPayload()});
+    const before = `/api/datasets/${encodeURIComponent(name)}/thumb/${encodeURIComponent(image)}?t=${encodeURIComponent(TOKEN)}`;
+    const after = `/api/datasets/${encodeURIComponent(name)}/adjust/preview/${encodeURIComponent(res.preview)}?t=${encodeURIComponent(TOKEN)}`;
+    $('#adjustPreview').innerHTML = `<div style="display:flex;gap:10px;flex-wrap:wrap">
+        <div><div class="hint">Before</div><img src="${before}" style="max-width:260px;border-radius:8px"></div>
+        <div><div class="hint">After</div><img src="${after}" style="max-width:260px;border-radius:8px"></div>
+      </div>`;
+  }catch(e){ toast(e.message); }
+}
+
+async function applyAdjust(name){
+  if (!_adjustStagedImages.length){ toast('Select at least one image first.'); return; }
+  if (!confirm(`Apply adjustments to ${_adjustStagedImages.length} image(s)? Originals are backed up and can be reverted.`)) return;
+  try{
+    const res = await post(`/api/datasets/${encodeURIComponent(name)}/adjust/apply`, {images: _adjustStagedImages, adjustments: buildAdjustmentsPayload()});
+    toast(`Adjusted ${res.applied.length} image(s)` + (res.errors.length ? `, ${res.errors.length} failed` : ''));
+    renderItems(name);
+  }catch(e){ toast(e.message); }
+}
+
+async function revertAdjust(name){
+  if (!confirm('Revert the last adjustment on the selected/staged images back to their originals?')) return;
+  try{
+    const body = _adjustStagedImages.length ? {images: _adjustStagedImages} : {};
+    const res = await post(`/api/datasets/${encodeURIComponent(name)}/adjust/revert`, body);
+    toast(`Reverted ${res.reverted.length} image(s).`);
+    renderItems(name);
+  }catch(e){ toast(e.message); }
 }
 
 function cancelEnhanceStaging(){

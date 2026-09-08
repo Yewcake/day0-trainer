@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 from . import enhance
+from .image_processing.pipeline import blocks_from_dict, execute_pipeline
 from .caption_prompts import (
     DEFAULT_VIDEO_CAPTION_INSTRUCTION,
     SMART_CLIP_INSTRUCTION_TEMPLATE,
@@ -103,7 +104,7 @@ def dataset_dir(name: str) -> Path:
     return path
 
 
-DATASET_CACHE_DIRS = {".thumbs", ".enhance"}
+DATASET_CACHE_DIRS = {".thumbs", ".enhance", ".adjust_backup", ".adjust_preview"}
 
 
 def dataset_images(path: Path) -> list[Path]:
@@ -931,6 +932,119 @@ def delete_dataset_image(name: str, image: str) -> dict:
     with _enhance_queue_lock:
         _enhance_queue.pop(f"{name}::{image}", None)
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Dataset adjustment pipeline (curves, LUT, white balance, color match, crop).
+# Pure deterministic pixel math -- no GPU/model inference -- so unlike
+# enhance/ below this runs inline in the request, no queue needed. Images
+# only for now (MiniMax H3's video datasets aren't wired in; PIL.Image.open()
+# on a video file just fails cleanly into the per-file error list below).
+#
+# Originals are backed up to .adjust_backup/ on first touch and never
+# overwritten by a later apply, so "apply" is always revertible via
+# /adjust/revert until the backup is explicitly cleared by reverting it.
+# --------------------------------------------------------------------------
+def _clear_dataset_image_cache(target: Path, filename: str) -> None:
+    thumb_dir = target / ".thumbs"
+    if thumb_dir.is_dir():
+        for stale in thumb_dir.glob(f"*_{filename}.jpg"):
+            stale.unlink(missing_ok=True)
+
+
+def _resolve_adjust_refs(target: Path, adjustments: dict) -> dict:
+    """Resolve dataset-relative filename refs in the raw adjustments payload
+    (currently just color_match's reference_image) into real paths the
+    pipeline module expects -- keeps the API filename-based like every other
+    dataset endpoint instead of leaking filesystem paths to the frontend."""
+    adjustments = dict(adjustments)
+    cm = adjustments.get("color_match")
+    if cm and cm.get("reference_image"):
+        resolved = dict(cm)
+        resolved["reference_path"] = str(target / safe_name(resolved.pop("reference_image")))
+        adjustments["color_match"] = resolved
+    return adjustments
+
+
+@app.post("/api/datasets/{name}/adjust/preview", dependencies=[Depends(require_auth)])
+def adjust_preview(name: str, payload: dict) -> dict:
+    target = dataset_dir(name)
+    image = safe_name(str(payload.get("image", "")))
+    source = target / image
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="Image not found.")
+    blocks = blocks_from_dict(_resolve_adjust_refs(target, payload.get("adjustments") or {}))
+    try:
+        with Image.open(source) as img:
+            result = execute_pipeline(img, blocks)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Adjustment failed: {exc}")
+    preview_dir = target / ".adjust_preview"
+    preview_dir.mkdir(exist_ok=True)
+    token = f"{uuid.uuid4().hex}.jpg"
+    result.convert("RGB").save(preview_dir / token, "JPEG", quality=92)
+    return {"preview": token}
+
+
+@app.get("/api/datasets/{name}/adjust/preview/{token}", dependencies=[Depends(require_auth)])
+def adjust_preview_file(name: str, token: str) -> FileResponse:
+    path = dataset_dir(name) / ".adjust_preview" / safe_name(token)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Preview not found.")
+    return FileResponse(path)
+
+
+@app.post("/api/datasets/{name}/adjust/apply", dependencies=[Depends(require_auth)])
+def adjust_apply(name: str, payload: dict) -> dict:
+    target = dataset_dir(name)
+    images = payload.get("images")
+    filenames = [safe_name(i) for i in images] if images else [p.name for p in dataset_images(target)]
+    if not filenames:
+        raise HTTPException(status_code=400, detail="No images to adjust.")
+    blocks = blocks_from_dict(_resolve_adjust_refs(target, payload.get("adjustments") or {}))
+    if not blocks:
+        raise HTTPException(status_code=400, detail="No adjustments given.")
+    backup_dir = target / ".adjust_backup"
+    backup_dir.mkdir(exist_ok=True)
+    applied: list[str] = []
+    errors: list[dict] = []
+    for filename in filenames:
+        source = target / filename
+        if not source.is_file():
+            errors.append({"image": filename, "error": "not found"})
+            continue
+        try:
+            with Image.open(source) as img:
+                result = execute_pipeline(img, blocks)
+            backup = backup_dir / filename
+            if not backup.exists():  # first touch only -- never clobber an earlier original
+                shutil.copy2(source, backup)
+            result.save(source)
+            _clear_dataset_image_cache(target, filename)
+            applied.append(filename)
+        except Exception as exc:
+            errors.append({"image": filename, "error": str(exc)})
+    return {"applied": applied, "errors": errors}
+
+
+@app.post("/api/datasets/{name}/adjust/revert", dependencies=[Depends(require_auth)])
+def adjust_revert(name: str, payload: dict) -> dict:
+    target = dataset_dir(name)
+    backup_dir = target / ".adjust_backup"
+    images = payload.get("images")
+    if images:
+        filenames = [safe_name(i) for i in images]
+    else:
+        filenames = [p.name for p in backup_dir.iterdir() if p.is_file()] if backup_dir.is_dir() else []
+    reverted: list[str] = []
+    for filename in filenames:
+        backup = backup_dir / filename
+        if backup.is_file():
+            shutil.copy2(backup, target / filename)
+            backup.unlink()
+            _clear_dataset_image_cache(target, filename)
+            reverted.append(filename)
+    return {"reverted": reverted}
 
 
 # --------------------------------------------------------------------------

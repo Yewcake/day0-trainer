@@ -45,7 +45,7 @@ RUN pip install -U \
     git+https://github.com/huggingface/diffusers.git \
     git+https://github.com/huggingface/transformers.git && \
     pip install -U accelerate peft safetensors pillow tqdm wandb bitsandbytes \
-    hf-transfer sentencepiece protobuf requests \
+    hf-transfer sentencepiece protobuf requests scipy \
     fastapi "uvicorn[standard]" python-multipart
 
 COPY docker/start.sh /start.sh
