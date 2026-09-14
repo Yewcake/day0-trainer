@@ -39,6 +39,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trainer_brand", default="Day0 Made by Yewcake")
     parser.add_argument("--pretrained_model_name_or_path", required=True)
+    # Opt-in: if set, --pretrained_model_name_or_path is ignored and replaced with a
+    # local Diffusers folder built from this native (ComfyUI/Civitai-style) checkpoint.
+    # See krea2_checkpoint_convert.py -- everything downstream of this is unaware the
+    # swap happened at all.
+    parser.add_argument("--convert_native_checkpoint", default="")
+    parser.add_argument(
+        "--diffusers_scaffold_repo",
+        default="CalamitousFelicitousness/Krea-2-Base-Diffusers",
+    )
+    parser.add_argument("--converted_checkpoint_cache_dir", default="")
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--run_name", required=True)
@@ -1049,6 +1059,18 @@ def train(args: argparse.Namespace) -> None:
         f"Training compute dtype: {args.train_dtype}; "
         f"LoRA parameter dtype: {args.lora_dtype}; save dtype: {args.save_dtype}"
     )
+
+    if args.convert_native_checkpoint:
+        from krea2_checkpoint_convert import convert_native_checkpoint_to_diffusers
+
+        cache_root = Path(args.converted_checkpoint_cache_dir) if args.converted_checkpoint_cache_dir else (
+            Path(args.output_dir).parent.parent / "models" / "converted_checkpoints"
+        )
+        args.pretrained_model_name_or_path = convert_native_checkpoint_to_diffusers(
+            args.convert_native_checkpoint,
+            cache_root,
+            scaffold_repo=args.diffusers_scaffold_repo,
+        )
 
     run_dir = Path(args.output_dir) / args.run_name
     checkpoint_dir = run_dir / "checkpoints"

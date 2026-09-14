@@ -1464,6 +1464,10 @@ def create_job(payload: dict) -> dict:
         "save_dtype": "bfloat16",
         "lr_scheduler": "cosine",
         "seed": 42,
+        # Opt-in: a direct-download URL (or pod-local path) to a native ComfyUI/Civitai-style
+        # Krea2 checkpoint. When set, the trainer converts it to a Diffusers folder itself
+        # (see krea2_checkpoint_convert.py) and trains on that instead of model_path.
+        "custom_checkpoint_url": "",
     }
     if model_entry["arch"] == "minimax_h3":
         defaults.update({"rank": 64, "lora_alpha": 32, "lr_scheduler": "constant"})
@@ -1578,6 +1582,8 @@ def create_job(payload: dict) -> dict:
             "--seed", str(config["seed"]),
             "--enable_wandb", "0",
             "--masterchef_enabled", "1" if config["masterchef_enabled"] else "0",
+            "--convert_native_checkpoint", str(config["custom_checkpoint_url"]).strip(),
+            "--converted_checkpoint_cache_dir", str(WORKSPACE / "models" / "converted_checkpoints"),
         ]
 
     env = os.environ.copy()

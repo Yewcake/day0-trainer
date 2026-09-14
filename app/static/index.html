@@ -355,6 +355,10 @@ async function showTrain(){
     <div class="row" id="row-text-fusion"><label>Text fusion layers</label>
       <label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f_include_text_fusion" style="width:auto">Off = our finding — smaller, more flexible LoRA (recommended default). On = standard behavior, includes text_fusion layers, larger file — also loads fine in ComfyUI</label>
     </div>
+    <div class="row" id="row-custom-checkpoint"><label>Custom base checkpoint</label>
+      <div><input id="f_custom_checkpoint_url" type="text" placeholder="Leave blank for official Krea 2 Raw/Turbo. Or paste a direct .safetensors URL (HF/Civitai) of a native/ComfyUI-format Krea2 merge.">
+      <div class="hint">Advanced/experimental: trains on a community merge checkpoint instead of the official base. The pod converts it to Diffusers format automatically on first use (slow the first run, cached after). Untested merges can produce a broken model — the trainer will refuse to start rather than train on a silently corrupted checkpoint.</div></div>
+    </div>
     <div class="row" id="row-sample-prompts" style="align-items:start"><label style="padding-top:8px">Sample prompts</label>
       <div id="prompts"></div></div>
     <div style="margin-top:14px"><button class="primary" type="submit">Start training</button></div>
@@ -409,11 +413,15 @@ function onModelChange(){
   if (mcRow) mcRow.style.display = noMasterchefOrTextFusion ? 'none' : '';
   const tfRow = $('#row-text-fusion');
   if (tfRow) tfRow.style.display = noMasterchefOrTextFusion ? 'none' : '';
+  const ccRow = $('#row-custom-checkpoint');
+  if (ccRow) ccRow.style.display = noMasterchefOrTextFusion ? 'none' : ''; // conversion only understands Krea2's own transformer schema
   if (noMasterchefOrTextFusion){
     const mc = $('#f_masterchef');
     if (mc) mc.checked = false;
     const tf = $('#f_include_text_fusion');
     if (tf) tf.checked = false;
+    const cc = $('#f_custom_checkpoint_url');
+    if (cc) cc.value = '';
   }
 
   ['row-h3-partition', 'row-h3-quantsource', 'row-h3-frames', 'row-h3-shortedge', 'row-h3-audio',
@@ -582,6 +590,7 @@ async function submitJob(ev){
     auto_analyze: $('#f_autoanalyze').checked,
     masterchef_enabled: $('#f_masterchef').checked,
     include_text_fusion: $('#f_include_text_fusion').checked,
+    custom_checkpoint_url: $('#f_custom_checkpoint_url')?.value.trim() || '',
     partition: $('#f_partition').value, quant_source: $('#f_quantsource')?.value || 'bitsandbytes',
     guidance_distillation_scale:+$('#f_h3guidance').value,
     base_preservation_loss_weight:+$('#f_h3preserve').value,
