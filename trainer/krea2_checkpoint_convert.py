@@ -245,10 +245,18 @@ def convert_native_checkpoint_to_diffusers(
     # (train_krea2_lora_direct.py's own from_pretrained() call also re-checks this via
     # its "weights not used/newly initialized" and meta-tensor guards, so this is a
     # belt-and-suspenders check, not the only line of defense.)
+    import inspect
+
     from diffusers.models.transformers.transformer_krea2 import Krea2Transformer2DModel
 
+    # Filter against the *installed* class's real constructor signature rather than just
+    # dropping "_"-prefixed keys: the scaffold repo's saved config.json can drift from
+    # whatever diffusers commit this image's `pip install git+.../diffusers.git` pulled
+    # (Krea2 support is still moving upstream), and a stale/renamed field there should
+    # never hard-fail the conversion.
     raw_config = json.loads((scaffold_dir / "transformer" / "config.json").read_text())
-    transformer_config = {k: v for k, v in raw_config.items() if not k.startswith("_")}
+    valid_params = set(inspect.signature(Krea2Transformer2DModel.__init__).parameters) - {"self"}
+    transformer_config = {k: v for k, v in raw_config.items() if k in valid_params}
     with torch.device("meta"):
         expected_model = Krea2Transformer2DModel(**transformer_config)
     expected_state = expected_model.state_dict()
